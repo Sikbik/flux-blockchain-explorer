@@ -1,0 +1,33 @@
+# Flux daemon configuration for FluxIndexer
+# This file is auto-configured at container startup
+
+# RPC Settings
+server=1
+rpcuser=${FLUX_RPC_USER}
+rpcpassword=${FLUX_RPC_PASSWORD}
+rpcport=16124
+rpcallowip=127.0.0.1
+rpcallowip=172.0.0.0/8
+rpcallowip=::1
+
+# Required indexes for FluxIndexer
+addressindex=1
+timestampindex=1
+spentindex=1
+txindex=1
+
+# Performance
+dbcache=1024
+maxmempool=512
+
+# Network
+listen=0
+listenonion=0
+
+# Logging
+printtoconsole=1
+logips=1
+logtimestamps=1
+
+# Disable wallet (not needed for indexer)
+disablewallet=1

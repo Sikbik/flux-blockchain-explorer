@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Environment Variables
+.env
+.env.local
+.env.production
+.env.*.local
+
+# Build Outputs
+dist/
+.next/
+*.tsbuildinfo
+next-env.d.ts
+flux-indexer/frontend/out/
+
+# Database Cache (SQLite price cache)
+*.db
+*.db-shm
+*.db-wal
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Backup & Archive Files
+*.tar.gz
+*.zip
+backup.sh
+
+# Markdown files (except README.md and FLUX_TRANSACTION_SPECIFICATION.md)
+*.md
+!README.md
+!FLUX_TRANSACTION_SPECIFICATION.md
+
+# Keep important config
+!flux-spec.json

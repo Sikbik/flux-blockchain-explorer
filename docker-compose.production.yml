@@ -1,0 +1,161 @@
+# Production Docker Compose for Full FluxIndexer Stack
+# Components: PostgreSQL + FluxIndexer (daemon + indexer + dashboard) + Explorer
+# Suitable for deployment on Hetzner VPS or other production servers
+#
+# IMPORTANT: Replace all "CHANGE_THIS_*" placeholders with your secure passwords before deploying
+# Edit the password values directly in this file
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: fluxindexer-postgres-prod
+    shm_size: 1g
+    environment:
+      POSTGRES_DB: fluxindexer
+      POSTGRES_USER: fluxindexer
+      POSTGRES_PASSWORD: CHANGE_THIS_PASSWORD  # Replace with your secure PostgreSQL password
+    command: >
+      postgres
+      -c shared_buffers=2GB
+      -c effective_cache_size=8GB
+      -c maintenance_work_mem=512MB
+      -c work_mem=32MB
+      -c max_connections=100
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c random_page_cost=1.1
+    ports:
+      - "127.0.0.1:5432:5432"  # Only expose locally for security
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./flux-indexer/src/database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fluxindexer -d fluxindexer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - fluxindexer
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # FluxIndexer (Flux daemon + Indexer + Status Dashboard)
+  indexer:
+    build:
+      context: ./flux-indexer
+      dockerfile: Dockerfile
+    image: yourusername/flux-indexer:latest  # Replace 'yourusername' with your Docker Hub username
+    container_name: fluxindexer-prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Flux Daemon RPC Configuration (internal bundled daemon)
+      FLUX_RPC_URL: http://localhost:16124
+      FLUX_RPC_USER: fluxrpc
+      FLUX_RPC_PASSWORD: CHANGE_THIS_RPC_PASSWORD  # Replace with your secure Flux RPC password
+
+      # Database Configuration
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: fluxindexer
+      DB_USER: fluxindexer
+      DB_PASSWORD: CHANGE_THIS_PASSWORD  # Must match POSTGRES_PASSWORD above
+
+      # Indexer Configuration
+      INDEXER_BATCH_SIZE: 100
+      INDEXER_POLLING_INTERVAL: 1000
+      INDEXER_START_HEIGHT: -1  # -1 = start from genesis, or set to specific block height
+
+      # Bootstrap Configuration (optional - leave empty to sync from genesis)
+      BOOTSTRAP_URL: ""  # Example: https://your-cdn.com/flux_blockchain_data.tar.gz
+      DB_BOOTSTRAP_URL: ""  # Example: https://your-cdn.com/postgresql_fluxindexer.pgdump
+
+      # API Configuration
+      API_PORT: 42067
+      API_HOST: 0.0.0.0
+
+      # Logging
+      LOG_LEVEL: info
+    ports:
+      - "42067:42067"      # API + Status Dashboard
+      # - "16124:16124"  # Flux RPC (uncomment for debugging)
+    volumes:
+      - flux-data:/home/flux/.flux  # Persist blockchain data
+      - zcash-params:/home/flux/.zcash-params  # Zcash parameters (auto-downloaded on first run)
+    restart: unless-stopped
+    networks:
+      - fluxindexer
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:42067/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 3600s  # Allow time for migrations (up to 1 hour)
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # Flux Explorer (Frontend)
+  explorer:
+    build:
+      context: ./flux-explorer
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:42067
+    image: yourusername/flux-explorer:latest  # Replace 'yourusername' with your Docker Hub username
+    container_name: flux-explorer-prod
+    depends_on:
+      indexer:
+        condition: service_started  # Don't wait for health check (allows explorer to start during long bootstrap)
+    environment:
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: 1
+      HOSTNAME: 0.0.0.0
+      PORT: 42069
+
+      # Client-side API URL (for browser requests)
+      NEXT_PUBLIC_API_URL: http://localhost:42067
+
+      # Server-side API URL (for Next.js API routes inside container)
+      SERVER_API_URL: http://indexer:42067
+
+      # Optional: Public fallback (if deploying behind reverse proxy)
+      # NEXT_PUBLIC_FALLBACK_API_URL: https://your-domain.com/api
+    ports:
+      - "42069:42069"
+    restart: unless-stopped
+    networks:
+      - fluxindexer
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:42069"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  fluxindexer:
+    driver: bridge
+
+volumes:
+  postgres-data:
+    driver: local
+  flux-data:
+    driver: local
+  zcash-params:
+    driver: local

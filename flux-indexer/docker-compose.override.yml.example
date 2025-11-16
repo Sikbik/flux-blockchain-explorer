@@ -1,0 +1,21 @@
+# docker-compose.override.yml.example
+#
+# Optional: Use this if you already have Zcash parameters locally
+# (e.g., from running Blockbook or other Zcash-based software)
+#
+# To use:
+# 1. Copy this file to docker-compose.override.yml
+# 2. Edit the path to point to your local .zcash-params directory
+# 3. Run: docker compose up -d
+#
+# This will mount your existing params instead of downloading them (~900MB)
+
+version: '3.8'
+
+services:
+  indexer:
+    volumes:
+      # Override the zcash-params volume with your local directory
+      # Change this path to match your system:
+      - ~/.zcash-params:/home/flux/.zcash-params:ro  # Linux/Mac
+      # - C:\Users\YourName\.zcash-params:/home/flux/.zcash-params:ro  # Windows

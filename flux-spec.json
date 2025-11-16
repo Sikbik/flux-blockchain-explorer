@@ -1,0 +1,95 @@
+{
+  "version": 8,
+  "name": "fluxexplorer",
+  "description": "Flux Explorer - Full blockchain explorer with indexer and PostgreSQL database. Database grows over time (currently ~260GB). For faster deployment, set BOOTSTRAP_URL and DB_BOOTSTRAP_URL environment variables.",
+  "owner": "YOUR_ZELID_HERE",
+  "instances": 1,
+  "staticip": false,
+  "enterprise": "",
+  "compose": [
+    {
+      "name": "postgres",
+      "description": "PostgreSQL 15 database for blockchain data storage (current size: ~260GB)",
+      "repotag": "postgres:15-alpine",
+      "ports": [5432],
+      "containerPorts": [5432],
+      "domains": [""],
+      "environmentParameters": [
+        "POSTGRES_DB=fluxindexer",
+        "POSTGRES_USER=fluxindexer",
+        "POSTGRES_PASSWORD=CHANGE_THIS_PASSWORD"
+      ],
+      "commands": [
+        "postgres",
+        "-c shared_buffers=2GB",
+        "-c effective_cache_size=8GB",
+        "-c maintenance_work_mem=512MB",
+        "-c work_mem=32MB",
+        "-c max_connections=100",
+        "-c checkpoint_completion_target=0.9",
+        "-c wal_buffers=16MB",
+        "-c random_page_cost=1.1"
+      ],
+      "containerData": "/var/lib/postgresql/data",
+      "cpu": 2.0,
+      "ram": 20480,
+      "hdd": 400,
+      "shm": 1024,
+      "tiered": false
+    },
+    {
+      "name": "indexer",
+      "description": "Flux daemon (fluxd v9.0.5) + blockchain indexer + REST API (blockchain: ~45GB + 1GB Zcash params)",
+      "repotag": "littlestache/flux-indexer:latest",
+      "ports": [42067],
+      "containerPorts": [42067],
+      "domains": [""],
+      "environmentParameters": [
+        "FLUX_RPC_URL=http://localhost:16124",
+        "FLUX_RPC_USER=fluxrpc",
+        "FLUX_RPC_PASSWORD=CHANGE_THIS_RPC_PASSWORD",
+        "DB_HOST=fluxpostgres_fluxexplorer",
+        "DB_PORT=5432",
+        "DB_NAME=fluxindexer",
+        "DB_USER=fluxindexer",
+        "DB_PASSWORD=CHANGE_THIS_PASSWORD",
+        "INDEXER_BATCH_SIZE=100",
+        "INDEXER_POLLING_INTERVAL=1000",
+        "INDEXER_START_HEIGHT=-1",
+        "API_PORT=42067",
+        "API_HOST=0.0.0.0",
+        "LOG_LEVEL=info",
+        "BOOTSTRAP_URL=",
+        "DB_BOOTSTRAP_URL="
+      ],
+      "commands": [],
+      "containerData": "/home/flux/.flux",
+      "cpu": 4.0,
+      "ram": 4096,
+      "hdd": 200,
+      "tiered": false
+    },
+    {
+      "name": "explorer",
+      "description": "Flux Explorer web interface - Next.js frontend with auto-detect API URL",
+      "repotag": "littlestache/flux-explorer:latest",
+      "ports": [42069],
+      "containerPorts": [42069],
+      "domains": [""],
+      "environmentParameters": [
+        "NODE_ENV=production",
+        "NEXT_TELEMETRY_DISABLED=1",
+        "HOSTNAME=0.0.0.0",
+        "PORT=42069",
+        "NEXT_PUBLIC_SERVER_API_URL=AUTO",
+        "SERVER_API_URL=http://fluxindexer_fluxexplorer:42067"
+      ],
+      "commands": [],
+      "containerData": "/appdata",
+      "cpu": 1.0,
+      "ram": 2048,
+      "hdd": 20,
+      "tiered": false
+    }
+  ]
+}
