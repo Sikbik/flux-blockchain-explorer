@@ -672,7 +672,7 @@ Offset | Size              | Field              | Type       | Description
        | VarInt            | nShieldedSpend     | VarInt     | Number of Sapling spends
        | nShieldedSpend*384| vShieldedSpend[]   | SpendDesc[]| Sapling spend descriptions
        | VarInt            | nShieldedOutput    | VarInt     | Number of Sapling outputs
-       | nShieldedOutput*948| vShieldedOutput[] | OutputDesc[]| Sapling output descriptions
+       | nShieldedOutput*917| vShieldedOutput[] | OutputDesc[]| Sapling output descriptions (FLUX: 917 bytes each)
        | 64                | bindingSig         | char[64]   | Binding signature (if nShieldedSpend > 0 OR nShieldedOutput > 0)
        | VarInt            | nJoinSplit         | VarInt     | Number of JoinSplit descriptions (legacy)
        | nJoinSplit * 1698 | vJoinSplit[]       | JSDescription[] | JoinSplit descriptions (FLUX MODIFIED)
@@ -695,7 +695,9 @@ Offset | Size | Field           | Type       | Description
 Total: 384 bytes per Sapling spend
 ```
 
-### Sapling Output Description - 948 bytes each
+### Sapling Output Description - 917 bytes each (Flux)
+
+**CRITICAL: Flux uses 549-byte encCiphertext (NOT 580 like Zcash!)**
 
 ```
 Offset | Size | Field           | Type       | Description
@@ -704,20 +706,33 @@ Offset | Size | Field           | Type       | Description
 32     | 32   | cmu             | char[32]   | Note commitment u-coordinate
 64     | 32   | ephemeralKey    | char[32]   | Ephemeral Diffie-Hellman key
 96     | 192  | zkproof         | char[192]  | zk-SNARK proof (Groth16)
-288    | 580  | encCiphertext   | char[580]  | Encrypted note ciphertext
-868    | 80   | outCiphertext   | char[80]   | Encrypted memo field
+288    | 549  | encCiphertext   | char[549]  | Encrypted note ciphertext (FLUX CUSTOM!)
+837    | 80   | outCiphertext   | char[80]   | Encrypted memo field
 
-Total: 948 bytes per Sapling output
+Total: 917 bytes per Sapling output (Flux)
+Zcash: 948 bytes (31 bytes larger due to 580-byte encCiphertext)
 ```
 
-**CRITICAL DIFFERENCE from Sprout:**
+**encCiphertext Structure:**
+
+**Zcash (580 bytes):**
+- Encrypts 564-byte note plaintext (1-byte lead + 11-byte diversifier + 8-byte value + 32-byte rseed + 512-byte memo)
+- Uses XChaCha20Poly1305-IETF (adds 16-byte authentication tag)
+- Total: 564 + 16 = 580 bytes
+
+**Flux (549 bytes):**
+- Custom reduced size (31 bytes smaller than Zcash)
+- Total: 549 bytes
+
+**CRITICAL DIFFERENCES from Sprout:**
 - Sapling uses **Groth16** proofs (192 bytes) instead of PHGR13 (296 bytes)
-- Sapling ciphertexts are **580 + 80 bytes** instead of 601 bytes
+- Flux Sapling encCiphertext: **549 bytes** (vs 580 in Zcash)
+- Flux Sapling outCiphertext: **80 bytes** (same as Zcash)
 - Sapling is much more efficient than Sprout
 
 ### JoinSplit Description (Sapling v4) - 1698 bytes each
 
-**CRITICAL: Flux v4 uses 549-byte ciphertexts (NOT 601 like Zcash!)**
+**CRITICAL: Flux v4 uses 549-byte ciphertexts (NOT 580 like Zcash!)**
 
 This is a **Flux-specific modification** discovered through empirical testing.
 
@@ -737,8 +752,8 @@ Offset | Size | Field           | Type       | Description
 1149   | 549  | ciphertext[1]   | char[549]  | Second encrypted note (FLUX CUSTOM!)
 1698   | ---  | [end]           | ---        | Total: 1698 bytes per JoinSplit
 
-Difference from v2 Sprout: -104 bytes (52 bytes per ciphertext)
-Difference from Zcash v4: Same (-52 bytes per ciphertext)
+Difference from v2 Sprout (601-byte ciphertexts): -104 bytes (52 bytes × 2 ciphertexts)
+Difference from Zcash v4 Sapling (580-byte ciphertexts): -62 bytes (31 bytes × 2 ciphertexts)
 ```
 
 ### Binding Signature Requirement
@@ -832,8 +847,8 @@ for i in range(nShieldedOutput.value):
     offset += 32
     zkproof = data[offset:offset+192]  # Groth16
     offset += 192
-    encCiphertext = data[offset:offset+580]
-    offset += 580
+    encCiphertext = data[offset:offset+549]  # FLUX: 549 bytes (NOT 580!)
+    offset += 549
     outCiphertext = data[offset:offset+80]
     offset += 80
 
@@ -1318,12 +1333,12 @@ Display (hex):    031d6b6269a4514444ddd4000491fe546c3f617f738ba66277744ec755ef40
 - **Total JoinSplit size:** 1802 bytes
 
 **Version 4 (Sapling):**
-- **Flux:** 549 bytes per ciphertext (CUSTOM - 52 bytes smaller than Zcash)
-- **Zcash:** 601 bytes per ciphertext (standard)
-- **Total JoinSplit size:** 1698 bytes (Flux) vs 1802 bytes (Zcash)
+- **Flux:** 549 bytes per ciphertext (CUSTOM - 31 bytes smaller than Zcash)
+- **Zcash:** 580 bytes per ciphertext (Sapling encryption)
+- **Total JoinSplit size:** 1698 bytes (Flux) vs 1760 bytes (Zcash)
 
 **Discovery Method:**
-This was determined empirically by parsing actual Flux blocks and comparing transaction sizes from RPC vs parsed lengths. The difference of -104 bytes (52 bytes × 2 ciphertexts) was consistent across all v4 JoinSplit transactions.
+This was determined empirically by parsing actual Flux blocks and comparing transaction sizes from RPC vs parsed lengths. The difference of -62 bytes (31 bytes × 2 ciphertexts, compared to Zcash Sapling) was consistent across all v4 JoinSplit transactions.
 
 **Implementation:**
 
@@ -1776,12 +1791,13 @@ assert len(parsed_tx['vout']) == len(rpc_decoded['vout'])
 
 ```
 Sprout JoinSplit (v2):        1802 bytes
-Sapling JoinSplit (v4):       1698 bytes (-104 bytes)
+Sapling JoinSplit (v4):       1698 bytes (-104 bytes from Zcash)
 Sapling Spend:                 384 bytes
-Sapling Output:                948 bytes
+Sapling Output (FLUX):         917 bytes (Zcash: 948 bytes)
 Sprout ciphertext:             601 bytes
 Sapling JoinSplit ciphertext:  549 bytes (FLUX)
-Sapling output ciphertext:     580 + 80 bytes
+Sapling output encCiphertext:  549 bytes (FLUX) / 580 bytes (Zcash)
+Sapling output outCiphertext:   80 bytes
 Groth16 proof:                 192 bytes
 PHGR13 proof:                  296 bytes
 Ed25519 signature:              64 bytes
