@@ -80,8 +80,9 @@ export function getExpectedBlockReward(height: number): number {
     return 37.5;
   }
 
-  // PON era: no block subsidy calculation (handled separately)
-  return 0;
+  // PON era: fixed rewards totaling 14 FLUX
+  // (Cumulus: 1 + Nimbus: 3.5 + Stratus: 9 + Foundation: 0.5 = 14)
+  return 14;
 }
 
 /**

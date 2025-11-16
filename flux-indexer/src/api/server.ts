@@ -91,6 +91,39 @@ export class APIServer {
   private static readonly RICH_LIST_SUPPLY_CACHE_TTL = 30000; // 30 seconds
   private richListSupplyRefreshPromise: Promise<any> | null = null;
 
+  // Block reward constants
+  private static readonly FIRST_HALVING_HEIGHT = 657850;
+  private static readonly SECOND_HALVING_HEIGHT = 1313200;
+  private static readonly FOUNDATION_ACTIVATION_HEIGHT = 2020000; // PON fork
+
+  /**
+   * Calculate expected block reward at a given height
+   * Matches the logic from flux-explorer/src/lib/block-rewards.ts
+   */
+  private getExpectedBlockReward(height: number): number {
+    if (height < 1) return 0;
+
+    // Before first halving: 150 FLUX
+    if (height < APIServer.FIRST_HALVING_HEIGHT) {
+      return 150;
+    }
+
+    // After first halving, before second: 75 FLUX
+    if (height < APIServer.SECOND_HALVING_HEIGHT) {
+      return 75;
+    }
+
+    // After second halving: 37.5 FLUX
+    // 3rd halving was canceled, so it stays at 37.5 until PON fork
+    if (height < APIServer.FOUNDATION_ACTIVATION_HEIGHT) {
+      return 37.5;
+    }
+
+    // PON era: fixed rewards totaling 14 FLUX
+    // (Cumulus: 1 + Nimbus: 3.5 + Stratus: 9 + Foundation: 0.5 = 14)
+    return 14;
+  }
+
   constructor(
     private db: DatabaseConnection,
     private rpc: FluxRPCClient,
@@ -874,6 +907,20 @@ export class APIServer {
 
         const valueSat = row.output_total ? Number(row.output_total) : 0;
 
+        // Calculate fee correctly for coinbase transactions
+        // Fee = MAX(0, total_output - expected_block_reward)
+        // Negative values indicate unclaimed mining rewards (burned), not fees
+        let feeSat: number;
+        if (row.is_coinbase) {
+          const expectedReward = this.getExpectedBlockReward(blockData.height);
+          const expectedRewardSat = Math.floor(expectedReward * 1e8);
+          const calculatedFee = valueSat - expectedRewardSat;
+          // If output < expected, unclaimed rewards are burned - fee should be 0
+          feeSat = calculatedFee > 0 ? calculatedFee : 0;
+        } else {
+          feeSat = row.fee ? Number(row.fee) : 0;
+        }
+
         // Convert benchmark tier to tier name (handles both numeric and string values)
         let fluxnodeTier: string | null = null;
         if (row.benchmark_tier !== null && row.benchmark_tier !== undefined) {
@@ -905,8 +952,8 @@ export class APIServer {
           fluxnodeSignature: row.signature || null,
           valueSat,
           value: valueSat / 1e8,
-          feeSat: row.fee ? Number(row.fee) : 0,
-          fee: (row.fee ? Number(row.fee) : 0) / 1e8,
+          feeSat,
+          fee: feeSat / 1e8,
           size: row.size !== null && row.size !== undefined
             ? Number(row.size)
             : row.vsize !== null && row.vsize !== undefined
@@ -1112,6 +1159,24 @@ export class APIServer {
         }
       }
 
+      // Calculate fee correctly for coinbase transactions
+      // Coinbase transactions have no inputs (inputs.rows.length === 0)
+      // Fee = MAX(0, total_output - expected_block_reward)
+      // Negative values indicate unclaimed mining rewards (burned), not fees
+      const isCoinbase = inputs.rows.length === 0;
+      let feeZatoshis: bigint;
+
+      if (isCoinbase && txData.block_height) {
+        const expectedReward = this.getExpectedBlockReward(txData.block_height);
+        const expectedRewardZatoshis = BigInt(Math.floor(expectedReward * 100000000));
+        const outputTotal = BigInt(txData.output_total || 0);
+        const calculatedFee = outputTotal - expectedRewardZatoshis;
+        // If output < expected, unclaimed rewards are burned - fee should be 0
+        feeZatoshis = calculatedFee > BigInt(0) ? calculatedFee : BigInt(0);
+      } else {
+        feeZatoshis = txData.fee ? BigInt(txData.fee) : BigInt(0);
+      }
+
       res.json({
         txid: txData.txid,
         version: txData.version,
@@ -1152,7 +1217,7 @@ export class APIServer {
         vsize: vsizeBytes,
         value: txData.output_total ? txData.output_total.toString() : '0',
         valueIn: txData.input_total ? txData.input_total.toString() : '0',
-        fees: txData.fee ? txData.fee.toString() : '0',
+        fees: feeZatoshis.toString(),
         hex: hexValue,
       });
     } catch (error: any) {

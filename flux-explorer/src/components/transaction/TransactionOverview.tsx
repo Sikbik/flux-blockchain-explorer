@@ -36,17 +36,15 @@ export function TransactionOverview({ transaction }: TransactionOverviewProps) {
   const isCoinbase = hasNoInputs && isLikelyCoinbase;
 
   // Calculate fees and block reward
-  let feeDisplay = 0;
+  // The API now correctly calculates fees for coinbase transactions
+  const feeDisplay = transaction.fees || 0;
   let blockReward = transaction.valueOut;
 
   if (isCoinbase && transaction.blockheight !== undefined) {
-    // For coinbase: fee = total output - expected block reward
+    // For coinbase: block reward = expected reward (for display purposes)
+    // Actual output may be less (burned) or more (fees included)
     const expectedReward = getExpectedBlockReward(transaction.blockheight);
-    feeDisplay = transaction.valueOut - expectedReward;
     blockReward = expectedReward;
-  } else {
-    // For regular transactions (including shielded)
-    feeDisplay = transaction.fees || 0;
   }
 
   return (
