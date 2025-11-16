@@ -55,16 +55,47 @@ export function DateRangePicker({
   disabled,
 }: DateRangePickerProps) {
   const [open, setOpen] = React.useState(false);
+  const [tempRange, setTempRange] = React.useState<DateRange | undefined>(value);
+
+  // Sync temp range with value when dialog opens
+  React.useEffect(() => {
+    if (open) {
+      setTempRange(value);
+    }
+  }, [open, value]);
+
+  // Helper to format date in UTC to avoid timezone display issues
+  const formatUTC = (date: Date, formatStr: string): string => {
+    const year = date.getUTCFullYear();
+    const month = date.getUTCMonth();
+    const day = date.getUTCDate();
+    const utcDate = new Date(Date.UTC(year, month, day, 12, 0, 0)); // Noon UTC to avoid edge cases
+    return format(utcDate, formatStr);
+  };
 
   const displayText = React.useMemo(() => {
     if (value?.from) {
       if (value.to) {
-        return `${format(value.from, "MMM d, yyyy")} - ${format(value.to, "MMM d, yyyy")}`;
+        return `${formatUTC(value.from, "MMM d, yyyy")} - ${formatUTC(value.to, "MMM d, yyyy")}`;
       }
-      return format(value.from, "MMM d, yyyy");
+      return formatUTC(value.from, "MMM d, yyyy");
     }
     return placeholder;
   }, [value, placeholder]);
+
+  const handleSelect = (range: DateRange | undefined) => {
+    setTempRange(range);
+  };
+
+  const handleApply = () => {
+    onChange?.(tempRange);
+    setOpen(false);
+  };
+
+  const handleClear = () => {
+    setTempRange(undefined);
+    // Don't close the calendar, just clear the selection
+  };
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -84,25 +115,39 @@ export function DateRangePicker({
         </Button>
       </PopoverTrigger>
       <PopoverContent className="w-auto p-0" align="start">
-        <Calendar
-          initialFocus
-          mode="range"
-          defaultMonth={value?.from}
-          selected={value}
-          onSelect={(range) => {
-            onChange?.(range);
-            // Close popover when both dates are selected
-            if (range?.from && range?.to) {
-              setOpen(false);
-            }
-          }}
-          numberOfMonths={2}
-          disabled={(date) => {
-            if (minDate && date < minDate) return true;
-            if (maxDate && date > maxDate) return true;
-            return false;
-          }}
-        />
+        <div className="flex flex-col">
+          <Calendar
+            mode="range"
+            defaultMonth={value?.from}
+            selected={tempRange}
+            onSelect={handleSelect}
+            numberOfMonths={2}
+            disabled={(date) => {
+              if (minDate && date < minDate) return true;
+              if (maxDate && date > maxDate) return true;
+              return false;
+            }}
+          />
+          <div className="flex items-center gap-2 p-3 border-t">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleClear}
+              className="flex-1"
+            >
+              Clear
+            </Button>
+            <Button
+              variant="default"
+              size="sm"
+              onClick={handleApply}
+              disabled={!tempRange?.from || !tempRange?.to}
+              className="flex-1"
+            >
+              Apply
+            </Button>
+          </div>
+        </div>
       </PopoverContent>
     </Popover>
   );

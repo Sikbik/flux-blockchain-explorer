@@ -10,7 +10,7 @@ interface PageProps {
 
 export default function TransactionPage({ params }: PageProps) {
   return (
-    <div className="container py-8 max-w-[1600px] mx-auto">
+    <div className="container py-8 max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8">
       <Suspense fallback={<TransactionDetailSkeleton />}>
         <TransactionDetail txid={params.txid} />
       </Suspense>

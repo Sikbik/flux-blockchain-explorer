@@ -88,6 +88,14 @@ export function TransactionExportDialog({
     return new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999));
   };
 
+  // Helper: Format date in UTC for display
+  const formatDateUTC = (date: Date): string => {
+    const year = date.getUTCFullYear();
+    const month = date.getUTCMonth() + 1;
+    const day = date.getUTCDate();
+    return `${month}/${day}/${year}`;
+  };
+
   const handleExport = async (format: ExportFormat) => {
     if (!dateRange?.from || !dateRange?.to) {
       alert("Please select a date range");
@@ -353,31 +361,17 @@ export function TransactionExportDialog({
               </div>
 
               {/* Date range picker */}
-              <div className="flex gap-2">
-                <DateRangePicker
-                  value={dateRange}
-                  onChange={handleDateRangeChange}
-                  placeholder="Select custom date range"
-                  minDate={FLUX_GENESIS_DATE}
-                  maxDate={new Date()}
-                  className="flex-1"
-                />
-                {dateRange && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setDateRange(undefined)}
-                    className="px-3"
-                    title="Clear date range"
-                  >
-                    Clear
-                  </Button>
-                )}
-              </div>
+              <DateRangePicker
+                value={dateRange}
+                onChange={handleDateRangeChange}
+                placeholder="Select custom date range"
+                minDate={FLUX_GENESIS_DATE}
+                maxDate={new Date()}
+              />
 
               {isValidRange && dateRange.from && dateRange.to && (
                 <div className="text-xs text-muted-foreground">
-                  Transactions from {dateRange.from.toLocaleDateString()} to {dateRange.to.toLocaleDateString()}
+                  Transactions from {formatDateUTC(dateRange.from)} to {formatDateUTC(dateRange.to)} (UTC)
                 </div>
               )}
             </div>

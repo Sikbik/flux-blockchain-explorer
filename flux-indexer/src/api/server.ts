@@ -829,6 +829,15 @@ export class APIServer {
       const currentHeight = currentHeightResult.rows[0]?.max_height || 0;
       const confirmations = blockData.height ? Math.max(0, currentHeight - blockData.height + 1) : 0;
 
+      // Get next block hash
+      let nextBlockHash: string | null = null;
+      if (blockData.height !== null && blockData.height !== undefined) {
+        const nextBlock = await this.db.query('SELECT hash FROM blocks WHERE height = $1', [blockData.height + 1]);
+        if (nextBlock.rows.length > 0) {
+          nextBlockHash = nextBlock.rows[0].hash;
+        }
+      }
+
       const txResult = await this.db.query(`
         SELECT
           t.txid,
@@ -970,7 +979,7 @@ export class APIServer {
         itemsOnPage: pagedDetails.length,
         hash: blockData.hash,
         previousBlockHash: blockData.prev_hash,
-        nextBlockHash: null, // Would need to query for this
+        nextBlockHash,
         height: blockData.height,
         confirmations,
         size: blockData.size,

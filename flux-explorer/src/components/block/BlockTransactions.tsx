@@ -116,7 +116,7 @@ export function BlockTransactions({ block }: BlockTransactionsProps) {
   };
 
   return (
-    <Card>
+    <Card className="w-full max-w-full">
       <CardHeader>
         <div className="flex items-center justify-between">
           <CardTitle className="flex items-center gap-2">
@@ -153,7 +153,7 @@ export function BlockTransactions({ block }: BlockTransactionsProps) {
           )}
         </div>
       </CardHeader>
-      <CardContent className="space-y-3">
+      <CardContent className="space-y-3 w-full max-w-full overflow-x-hidden">
         {isLoading && currentDetails.length === 0 ? (
           Array.from({ length: TRANSACTIONS_PER_PAGE }).map((_, i) => (
             <div key={i} className="flex items-center gap-3 rounded-lg border bg-card p-3">
@@ -318,52 +318,83 @@ export function BlockTransactions({ block }: BlockTransactionsProps) {
         )}
 
         {totalPages > 1 && (
-          <div className="flex items-center justify-between pt-4 border-t">
-            <div className="flex items-center gap-1">
-              <Button variant="outline" size="sm" onClick={() => goToPage(1)} disabled={currentPage === 1} title="First page">
-                <ChevronsLeft className="h-4 w-4" />
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => goToPage(currentPage - 1)} disabled={currentPage === 1}>
-                <ChevronLeft className="h-4 w-4 mr-1" />
-                Previous
-              </Button>
-            </div>
+          <div className="w-full">
+            <div className="flex flex-col sm:flex-row items-center justify-center sm:justify-between gap-2 pt-4 border-t">
+              {/* Left navigation group */}
+              <div className="flex items-center gap-1 min-w-0">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => goToPage(1)}
+                  disabled={currentPage === 1}
+                  title="First page"
+                  className="h-8 w-8 sm:h-9 sm:w-9 p-0 flex-shrink-0"
+                >
+                  <ChevronsLeft className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => goToPage(currentPage - 1)}
+                  disabled={currentPage === 1}
+                  className="h-8 sm:h-9 px-2 sm:px-3 flex-shrink-0"
+                >
+                  <ChevronLeft className="h-4 w-4 sm:mr-1" />
+                  <span className="hidden sm:inline">Previous</span>
+                </Button>
+              </div>
 
-            <div className="flex items-center gap-1">
-              {Array.from({ length: Math.min(5, totalPages) }).map((_, i) => {
-                let pageNum: number;
-                if (totalPages <= 5) {
-                  pageNum = i + 1;
-                } else if (currentPage <= 3) {
-                  pageNum = i + 1;
-                } else if (currentPage >= totalPages - 2) {
-                  pageNum = totalPages - 4 + i;
-                } else {
-                  pageNum = currentPage - 2 + i;
-                }
+              {/* Page numbers - adaptive layout based on count */}
+              <div className="flex items-center justify-center gap-1 min-w-0 flex-wrap">
+                {Array.from({ length: Math.min(5, totalPages) }).map((_, i) => {
+                  let pageNum: number;
+                  if (totalPages <= 5) {
+                    pageNum = i + 1;
+                  } else if (currentPage <= 3) {
+                    pageNum = i + 1;
+                  } else if (currentPage >= totalPages - 2) {
+                    pageNum = totalPages - 4 + i;
+                  } else {
+                    pageNum = currentPage - 2 + i;
+                  }
 
-                return (
-                  <Button
-                    key={pageNum}
-                    variant={currentPage === pageNum ? "default" : "outline"}
-                    size="sm"
-                    onClick={() => goToPage(pageNum)}
-                    className="w-10"
-                  >
-                    {pageNum}
-                  </Button>
-                );
-              })}
-            </div>
+                  return (
+                    <Button
+                      key={pageNum}
+                      variant={currentPage === pageNum ? "default" : "outline"}
+                      size="sm"
+                      onClick={() => goToPage(pageNum)}
+                      className="h-8 w-8 sm:h-9 sm:w-10 p-0 text-xs sm:text-sm flex-shrink-0 min-w-0"
+                    >
+                      {pageNum}
+                    </Button>
+                  );
+                })}
+              </div>
 
-            <div className="flex items-center gap-1">
-              <Button variant="outline" size="sm" onClick={() => goToPage(currentPage + 1)} disabled={currentPage === totalPages}>
-                Next
-                <ChevronRight className="h-4 w-4 ml-1" />
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => goToPage(totalPages)} disabled={currentPage === totalPages} title="Last page">
-                <ChevronsRight className="h-4 w-4" />
-              </Button>
+              {/* Right navigation group */}
+              <div className="flex items-center gap-1 min-w-0">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => goToPage(currentPage + 1)}
+                  disabled={currentPage === totalPages}
+                  className="h-8 sm:h-9 px-2 sm:px-3 flex-shrink-0"
+                >
+                  <span className="hidden sm:inline">Next</span>
+                  <ChevronRight className="h-4 w-4 sm:ml-1" />
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => goToPage(totalPages)}
+                  disabled={currentPage === totalPages}
+                  title="Last page"
+                  className="h-8 w-8 sm:h-9 sm:w-9 p-0 flex-shrink-0"
+                >
+                  <ChevronsRight className="h-4 w-4" />
+                </Button>
+              </div>
             </div>
           </div>
         )}

@@ -72,14 +72,18 @@ export function AddressHeader({ addressInfo }: AddressHeaderProps) {
 
             {/* QR Code Display */}
             {showQR && (
-              <div className="flex justify-center items-center p-6 bg-white rounded-lg border">
+              <div className="flex justify-center items-center p-6 bg-card rounded-lg border">
                 <div className="text-center space-y-4">
-                  <QRCodeSVG
-                    value={addressInfo.addrStr}
-                    size={200}
-                    level="H"
-                    includeMargin={true}
-                  />
+                  <div className="p-4 bg-white rounded-lg">
+                    <QRCodeSVG
+                      value={addressInfo.addrStr}
+                      size={200}
+                      level="H"
+                      includeMargin={true}
+                      bgColor="#ffffff"
+                      fgColor="#000000"
+                    />
+                  </div>
                   <p className="text-xs text-muted-foreground max-w-xs">
                     Scan this QR code to copy the address
                   </p>
