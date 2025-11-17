@@ -181,13 +181,13 @@ CREATE OR REPLACE FUNCTION update_address_summary(addr TEXT)
 RETURNS VOID AS $$
 DECLARE
   summary_data RECORD;
+  actual_tx_count BIGINT;
 BEGIN
-  -- Single query to calculate all statistics at once (7x faster than 7 separate queries)
+  -- Single query to calculate UTXO-based statistics (balance, received, sent)
   SELECT
     COALESCE(SUM(CASE WHEN spent = false THEN value ELSE 0 END), 0) as balance,
     COALESCE(SUM(value), 0) as received,
     COALESCE(SUM(CASE WHEN spent = true THEN value ELSE 0 END), 0) as sent,
-    COUNT(DISTINCT txid) as tx_count,
     COUNT(CASE WHEN spent = false THEN 1 END) as unspent_count,
     MIN(block_height) as first_seen,
     MAX(GREATEST(block_height, COALESCE(spent_block_height, 0))) as last_activity
@@ -195,14 +195,22 @@ BEGIN
   FROM utxos
   WHERE address = addr;
 
-  -- Upsert address summary
+  -- FIX: Get ACTUAL transaction count from address_transactions table
+  -- Bug was: COUNT(DISTINCT txid) from utxos misses transactions where address is in inputs only
+  -- This is the source of truth for transaction history
+  SELECT COUNT(*)
+  INTO actual_tx_count
+  FROM address_transactions
+  WHERE address = addr;
+
+  -- Upsert address summary with CORRECT tx_count
   INSERT INTO address_summary (
     address, balance, tx_count, received_total, sent_total,
     unspent_count, first_seen, last_activity, updated_at
   ) VALUES (
     addr,
     summary_data.balance,
-    summary_data.tx_count,
+    actual_tx_count,  -- FIX: Use actual count from address_transactions instead of utxos
     summary_data.received,
     summary_data.sent,
     summary_data.unspent_count,
@@ -212,7 +220,7 @@ BEGIN
   )
   ON CONFLICT (address) DO UPDATE SET
     balance = EXCLUDED.balance,
-    tx_count = EXCLUDED.tx_count,
+    tx_count = EXCLUDED.tx_count,  -- FIX: Update with correct count
     received_total = EXCLUDED.received_total,
     sent_total = EXCLUDED.sent_total,
     unspent_count = EXCLUDED.unspent_count,
