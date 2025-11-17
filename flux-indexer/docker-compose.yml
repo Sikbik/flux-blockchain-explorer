@@ -9,9 +9,20 @@ services:
     environment:
       POSTGRES_DB: fluxindexer
       POSTGRES_USER: fluxindexer
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-fluxpass}
+      # SECURITY WARNING: Change default password before deployment!
+      # Set DB_PASSWORD environment variable to override
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-CHANGE_THIS_PASSWORD}
     ports:
-      - "5432:5432"
+      # Security: Only expose to localhost (not 0.0.0.0)
+      - "127.0.0.1:5432:5432"
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 16G  # Current usage: ~12GB, allows growth headroom
+        reservations:
+          cpus: '2'
+          memory: 8G
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./src/database/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
@@ -34,14 +45,18 @@ services:
       # Flux Daemon RPC Configuration (internal bundled daemon)
       FLUX_RPC_URL: http://localhost:16124
       FLUX_RPC_USER: ${FLUX_RPC_USER:-fluxrpc}
-      FLUX_RPC_PASSWORD: ${FLUX_RPC_PASSWORD:-change_this_password}
+      # SECURITY WARNING: Change default password before deployment!
+      # Set FLUX_RPC_PASSWORD environment variable to override
+      FLUX_RPC_PASSWORD: ${FLUX_RPC_PASSWORD:-CHANGE_THIS_RPC_PASSWORD}
 
       # Database Configuration
       DB_HOST: postgres
       DB_PORT: 5432
       DB_NAME: fluxindexer
       DB_USER: fluxindexer
-      DB_PASSWORD: ${DB_PASSWORD:-fluxpass}
+      # SECURITY WARNING: Must match POSTGRES_PASSWORD above
+      # Set DB_PASSWORD environment variable to override
+      DB_PASSWORD: ${DB_PASSWORD:-CHANGE_THIS_PASSWORD}
 
       # Indexer Configuration
       INDEXER_BATCH_SIZE: ${INDEXER_BATCH_SIZE:-100}
@@ -56,7 +71,16 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       - "42067:42067"    # API + Dashboard (bundled frontend)
-      - "16124:16124"    # Expose Flux RPC (optional, for debugging)
+      # Security: RPC port only exposed to localhost for debugging
+      - "127.0.0.1:16124:16124"    # Flux RPC (localhost only)
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 6G  # Current usage: ~2GB, allows growth headroom
+        reservations:
+          cpus: '2'
+          memory: 2G
     volumes:
       - flux-data:/home/flux/.flux  # Persist blockchain data
       - zcash-params:/home/flux/.zcash-params  # Zcash parameters (auto-downloaded on first run)

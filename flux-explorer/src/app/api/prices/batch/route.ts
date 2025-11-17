@@ -25,6 +25,25 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Security: Enforce maximum array size to prevent DoS
+    const MAX_TIMESTAMPS = 1000;
+    if (timestamps.length > MAX_TIMESTAMPS) {
+      return NextResponse.json(
+        { error: `Maximum ${MAX_TIMESTAMPS} timestamps allowed per request` },
+        { status: 400 }
+      );
+    }
+
+    // Security: Validate each timestamp is a valid positive number
+    for (const ts of timestamps) {
+      if (!Number.isFinite(ts) || ts <= 0) {
+        return NextResponse.json(
+          { error: "All timestamps must be positive finite numbers" },
+          { status: 400 }
+        );
+      }
+    }
+
     // Lookup prices from cache (finds closest within 2 hours)
     const results: Record<number, number | null> = {};
 

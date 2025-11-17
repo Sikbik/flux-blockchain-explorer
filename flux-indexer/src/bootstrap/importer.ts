@@ -10,7 +10,7 @@ import { logger } from '../utils/logger';
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import https from 'https';
 import http from 'http';
 
@@ -116,9 +116,38 @@ export class BootstrapImporter {
         password: process.env.DB_PASSWORD || 'password',
       };
 
-      const pgRestoreCmd = `PGPASSWORD="${dbConfig.password}" pg_restore -h ${dbConfig.host} -p ${dbConfig.port} -U ${dbConfig.user} -d ${dbConfig.database} -v --clean --if-exists ${extractedFile}`;
+      // Security: Use spawn instead of shell to prevent command injection
+      // Pass credentials via environment variable, not command line
+      await new Promise<void>((resolve, reject) => {
+        const pgRestore = spawn('pg_restore', [
+          '-h', dbConfig.host,
+          '-p', dbConfig.port.toString(),
+          '-U', dbConfig.user,
+          '-d', dbConfig.database,
+          '-v',
+          '--clean',
+          '--if-exists',
+          extractedFile
+        ], {
+          env: {
+            ...process.env,
+            PGPASSWORD: dbConfig.password
+          },
+          stdio: 'inherit'
+        });
 
-      await execAsync(pgRestoreCmd);
+        pgRestore.on('close', (code) => {
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new Error(`pg_restore exited with code ${code}`));
+          }
+        });
+
+        pgRestore.on('error', (err) => {
+          reject(err);
+        });
+      });
 
       logger.info('Bootstrap import completed!');
 

@@ -58,12 +58,50 @@ async function proxyRequest(
   method: string
 ) {
   try {
+    // Security: Validate path segments to prevent path traversal
+    const invalidSegments = pathSegments.filter(segment =>
+      segment === '..' || segment === '.' || segment.includes('/')
+    );
+
+    if (invalidSegments.length > 0) {
+      return NextResponse.json(
+        { error: "Invalid path segments detected" },
+        { status: 400 }
+      );
+    }
+
     // Reconstruct the path
     const path = pathSegments.join('/');
+
+    // Security: Ensure only API routes are proxied
+    if (!path.startsWith('api/v')) {
+      return NextResponse.json(
+        { error: "Only /api/v* routes can be proxied" },
+        { status: 403 }
+      );
+    }
+
+    // Security: Maximum path length to prevent long path DoS
+    const MAX_PATH_LENGTH = 500;
+    if (path.length > MAX_PATH_LENGTH) {
+      return NextResponse.json(
+        { error: "Path too long" },
+        { status: 414 }
+      );
+    }
 
     // Get search params from the request
     const searchParams = request.nextUrl.searchParams.toString();
     const queryString = searchParams ? `?${searchParams}` : '';
+
+    // Security: Maximum query string length
+    const MAX_QUERY_LENGTH = 2000;
+    if (queryString.length > MAX_QUERY_LENGTH) {
+      return NextResponse.json(
+        { error: "Query string too long" },
+        { status: 414 }
+      );
+    }
 
     // Build the target URL
     const targetUrl = `${INDEXER_API_URL}/${path}${queryString}`;
@@ -87,6 +125,16 @@ async function proxyRequest(
     if (['POST', 'PUT', 'PATCH'].includes(method)) {
       try {
         const body = await request.text();
+
+        // Security: Limit request body size to prevent memory exhaustion
+        const MAX_BODY_SIZE = 1024 * 1024; // 1MB
+        if (body.length > MAX_BODY_SIZE) {
+          return NextResponse.json(
+            { error: `Request body exceeds maximum size of ${MAX_BODY_SIZE} bytes` },
+            { status: 413 }
+          );
+        }
+
         if (body) {
           options.body = body;
         }

@@ -95,13 +95,39 @@ interface IndexerSupplyStatsResponse {
 export async function GET(request: NextRequest) {
   try {
     // Allow overriding min balance but default to 1 FLUX
-    const minBalanceParam = parseInt(
-      request.nextUrl.searchParams.get("minBalance") || "1",
-      10
-    );
-    const minBalance = Number.isFinite(minBalanceParam)
-      ? Math.max(0, minBalanceParam)
-      : 1;
+    const minBalanceStr = request.nextUrl.searchParams.get("minBalance");
+    let minBalance = 1;
+
+    if (minBalanceStr) {
+      const parsed = parseInt(minBalanceStr, 10);
+
+      // Security: Validate input is a valid finite number
+      if (!Number.isFinite(parsed) || isNaN(parsed)) {
+        return NextResponse.json(
+          { error: "minBalance must be a valid finite positive integer" },
+          { status: 400 }
+        );
+      }
+
+      // Security: Reject negative numbers
+      if (parsed < 0) {
+        return NextResponse.json(
+          { error: "minBalance must be non-negative" },
+          { status: 400 }
+        );
+      }
+
+      // Security: Reject unreasonably large values (max supply is 560M FLUX)
+      const MAX_BALANCE = 560000000 * 1e8; // in zatoshis
+      if (parsed > MAX_BALANCE) {
+        return NextResponse.json(
+          { error: `minBalance cannot exceed maximum supply` },
+          { status: 400 }
+        );
+      }
+
+      minBalance = parsed;
+    }
 
     // Request coalescing: create cache key based on query params
     const cacheKey = `richlist:${minBalance}`;
