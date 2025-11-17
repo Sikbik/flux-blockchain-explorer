@@ -8,10 +8,13 @@ import { NextRequest, NextResponse } from "next/server";
 import ky from "ky";
 import type { RichListData, RichListAddress } from "@/types/rich-list";
 
+// Get indexer URL from environment
+// Production (Flux/VPS): SERVER_API_URL set via docker-compose
+// Local dev: Falls back to 127.0.0.1:42067 (IPv4 explicit to avoid IPv6 issues)
 const INDEXER_API_URL =
   process.env.SERVER_API_URL ||
   process.env.INDEXER_API_URL ||
-  "http://indexer:3002";
+  "http://127.0.0.1:42067";
 
 const CACHE_DURATION = 3600; // 1 hour cache
 const PAGE_SIZE = 1000; // Fetch all addresses in single request for speed

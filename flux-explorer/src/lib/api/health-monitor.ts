@@ -29,8 +29,9 @@ export interface ApiEndpoint {
 function getApiEndpoints(): ApiEndpoint[] {
   const endpoints: ApiEndpoint[] = [];
 
-  // FluxIndexer API endpoint
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002';
+  // In browser: Use Next.js proxy route (works on all deployments)
+  // Can be overridden with NEXT_PUBLIC_API_URL if needed
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || '/api/indexer';
 
   console.log('[Health Monitor] Environment check:', {
     NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL,

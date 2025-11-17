@@ -242,26 +242,29 @@ interface FluxIndexerLatestBlocksResponse {
 }
 
 // Support both server-side and client-side API URL configuration
-// Server-side (API routes): SERVER_API_URL (Docker internal) or NEXT_PUBLIC_API_URL
-// Client-side (browser): NEXT_PUBLIC_API_URL (browser-accessible)
+// Server-side (SSR/API routes): SERVER_API_URL (Docker internal network)
+// Client-side (browser): /api/indexer (Next.js proxy route - works on any domain)
 function getApiBaseUrl(): string {
   // Check if we're running on the server or client
   const isServer = typeof window === 'undefined';
 
   if (isServer) {
-    // Server-side: Use SERVER_API_URL (Docker internal) or fallback to NEXT_PUBLIC_API_URL
-    const apiUrl = process.env.SERVER_API_URL || process.env.NEXT_PUBLIC_API_URL;
-    return apiUrl || "http://localhost:3002";
+    // Server-side: Use SERVER_API_URL (Docker internal) for direct indexer access
+    // Falls back to 127.0.0.1:42067 (IPv4 explicit) for local development
+    const apiUrl = process.env.SERVER_API_URL;
+    return apiUrl || "http://127.0.0.1:42067";
   } else {
-    // Client-side: Auto-detect from browser URL for FluxOS multi-node deployment
-    if (process.env.NEXT_PUBLIC_API_URL === 'AUTO' || !process.env.NEXT_PUBLIC_API_URL) {
-      // Auto-detect: Use same host as the explorer, port 3002
-      const protocol = window.location.protocol;
-      const hostname = window.location.hostname;
-      return `${protocol}//${hostname}:3002`;
+    // Client-side: Use Next.js proxy route unless explicit URL is provided
+    // This works on Flux deployments, custom domains, and VPS
+    const explicitUrl = process.env.NEXT_PUBLIC_API_URL;
+
+    // If explicit URL is provided and not "AUTO", use it
+    if (explicitUrl && explicitUrl !== 'AUTO') {
+      return explicitUrl;
     }
-    // Use explicit URL if provided
-    return process.env.NEXT_PUBLIC_API_URL;
+
+    // Default to Next.js proxy route (works everywhere)
+    return '/api/indexer';
   }
 }
 

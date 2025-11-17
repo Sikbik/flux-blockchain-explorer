@@ -9,7 +9,9 @@ import { NextResponse } from "next/server";
 
 export async function GET() {
   try {
-    const indexerUrl = process.env.SERVER_API_URL || process.env.NEXT_PUBLIC_SERVER_API_URL || "http://localhost:3002";
+    // Production (Flux/VPS): SERVER_API_URL set via docker-compose
+    // Local dev: Falls back to 127.0.0.1:42067 (IPv4 explicit to avoid IPv6 issues)
+    const indexerUrl = process.env.SERVER_API_URL || process.env.NEXT_PUBLIC_SERVER_API_URL || "http://127.0.0.1:42067";
     const response = await fetch(`${indexerUrl}/api/v1/supply`, {
       headers: {
         "Accept": "application/json",

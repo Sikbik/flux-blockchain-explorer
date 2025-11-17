@@ -53,8 +53,9 @@ export async function GET() {
     NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL,
   });
 
-  // Use SERVER_API_URL for server-side requests (Docker internal), fallback to NEXT_PUBLIC_API_URL
-  const apiUrl = process.env.SERVER_API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002';
+  // Production (Flux/VPS): SERVER_API_URL set via docker-compose
+  // Local dev: Falls back to 127.0.0.1:42067 (IPv4 explicit to avoid IPv6 issues)
+  const apiUrl = process.env.SERVER_API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:42067';
 
   console.log('[Health API] Resolved API URL:', apiUrl);
 

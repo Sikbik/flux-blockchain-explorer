@@ -49,13 +49,13 @@ services:
       INDEXER_START_HEIGHT: ${INDEXER_START_HEIGHT:-0}
 
       # API Configuration
-      API_PORT: 3002
+      API_PORT: 42067
       API_HOST: 0.0.0.0
 
       # Logging
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
-      - "3002:3002"      # API + Dashboard (bundled frontend)
+      - "42067:42067"    # API + Dashboard (bundled frontend)
       - "16124:16124"    # Expose Flux RPC (optional, for debugging)
     volumes:
       - flux-data:/home/flux/.flux  # Persist blockchain data
@@ -64,7 +64,7 @@ services:
     networks:
       - fluxindexer
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3002/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:42067/health"]
       interval: 30s
       timeout: 10s
       retries: 3
