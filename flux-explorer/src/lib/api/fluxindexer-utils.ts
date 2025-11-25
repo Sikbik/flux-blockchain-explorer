@@ -116,6 +116,10 @@ interface FluxIndexerAddress {
   unconfirmedTxs?: number;
   txs?: number;
   transactions?: Array<{ txid: string }>;
+  cumulusCount?: number;
+  nimbusCount?: number;
+  stratusCount?: number;
+  fluxnodeLastSync?: string | null;
 }
 
 /**
@@ -305,5 +309,9 @@ export function convertFluxIndexerAddress(bbAddr: FluxIndexerAddress): AddressIn
     unconfirmedTxApperances: bbAddr.unconfirmedTxs || 0,
     txApperances: bbAddr.txs || 0,
     transactions: bbAddr.transactions?.map((tx: { txid: string }) => tx.txid) || [],
+    cumulusCount: bbAddr.cumulusCount,
+    nimbusCount: bbAddr.nimbusCount,
+    stratusCount: bbAddr.stratusCount,
+    fluxnodeLastSync: bbAddr.fluxnodeLastSync,
   };
 }

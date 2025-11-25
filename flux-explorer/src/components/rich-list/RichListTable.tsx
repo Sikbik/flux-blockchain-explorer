@@ -61,6 +61,7 @@ export function RichListTable() {
   const [error, setError] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [addresses, setAddresses] = useState<RichListAddress[]>([]);
+  const [excludeSwapPools, setExcludeSwapPools] = useState(true);
 
   useEffect(() => {
     fetchRichList();
@@ -143,24 +144,81 @@ export function RichListTable() {
   };
 
   // Compute derived values with useMemo (must be before any early returns)
-  const totalPages = Math.max(1, Math.ceil(addresses.length / ROWS_PER_PAGE));
+  // Filter and recalculate percentages based on swap pool exclusion
+  const displayAddresses = useMemo(() => {
+    if (!excludeSwapPools) {
+      // Include all addresses with original percentages
+      return addresses;
+    }
+
+    // Filter out swap pools and recalculate percentages
+    const filtered = addresses.filter(addr => addr.category !== 'Swap Pool');
+
+    // Calculate total balance of non-swap-pool addresses
+    const totalNonSwapBalance = filtered.reduce((sum, addr) => sum + addr.balance, 0);
+
+    // Recalculate percentages based on non-swap-pool total
+    return filtered.map((addr, index) => ({
+      ...addr,
+      rank: index + 1, // Renumber ranks after filtering
+      percentage: totalNonSwapBalance > 0 ? (addr.balance / totalNonSwapBalance) * 100 : 0,
+    }));
+  }, [addresses, excludeSwapPools]);
+
+  const totalPages = Math.max(1, Math.ceil(displayAddresses.length / ROWS_PER_PAGE));
   const paginatedAddresses = useMemo(() => {
     const start = (currentPage - 1) * ROWS_PER_PAGE;
-    return addresses.slice(start, start + ROWS_PER_PAGE);
-  }, [addresses, currentPage]);
+    return displayAddresses.slice(start, start + ROWS_PER_PAGE);
+  }, [displayAddresses, currentPage]);
+
+  // Reset to page 1 when filter changes if current page is out of bounds
+  useEffect(() => {
+    if (currentPage > totalPages && totalPages > 0) {
+      setCurrentPage(1);
+    }
+  }, [excludeSwapPools, currentPage, totalPages]);
 
   const breakdown = useMemo(
-    () => metadata ? buildCategoryBreakdown(addresses, metadata.totalSupply, metadata.shieldedPool) : [],
-    [addresses, metadata]
+    () => metadata ? buildCategoryBreakdown(addresses, metadata.totalSupply, metadata.shieldedPool, excludeSwapPools) : [],
+    [addresses, metadata, excludeSwapPools]
   );
-  const top10Share = useMemo(
-    () => metadata ? computeShare(addresses.slice(0, 10), metadata.totalSupply) : 0,
-    [addresses, metadata]
-  );
-  const top100Share = useMemo(
-    () => metadata ? computeShare(addresses.slice(0, 100), metadata.totalSupply) : 0,
-    [addresses, metadata]
-  );
+  const top10Share = useMemo(() => {
+    if (!metadata) return 0;
+    const top10 = addresses.slice(0, 10);
+    const filtered = excludeSwapPools ? top10.filter(addr => addr.category !== 'Swap Pool') : top10;
+
+    // Calculate denominator based on exclusion setting
+    let denominator: number;
+    if (excludeSwapPools) {
+      // Use sum of all non-swap-pool balances (relative distribution)
+      denominator = addresses
+        .filter(addr => addr.category !== 'Swap Pool')
+        .reduce((sum, addr) => sum + addr.balance, 0);
+    } else {
+      denominator = metadata.totalSupply;
+    }
+
+    return computeShare(filtered, denominator);
+  }, [addresses, metadata, excludeSwapPools]);
+
+  const top100Share = useMemo(() => {
+    if (!metadata) return 0;
+    const top100 = addresses.slice(0, 100);
+    const filtered = excludeSwapPools ? top100.filter(addr => addr.category !== 'Swap Pool') : top100;
+
+    // Calculate denominator based on exclusion setting
+    let denominator: number;
+    if (excludeSwapPools) {
+      // Use sum of all non-swap-pool balances (relative distribution)
+      denominator = addresses
+        .filter(addr => addr.category !== 'Swap Pool')
+        .reduce((sum, addr) => sum + addr.balance, 0);
+    } else {
+      denominator = metadata.totalSupply;
+    }
+
+    return computeShare(filtered, denominator);
+  }, [addresses, metadata, excludeSwapPools]);
 
   // Loading state
   if (loading && !metadata) {
@@ -200,6 +258,8 @@ export function RichListTable() {
         top10Share={top10Share}
         top100Share={top100Share}
         breakdown={breakdown}
+        excludeSwapPools={excludeSwapPools}
+        setExcludeSwapPools={setExcludeSwapPools}
       />
 
       {/* Metadata Info */}
@@ -366,8 +426,8 @@ export function RichListTable() {
       <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
         <p className="text-sm text-muted-foreground">
           Showing {((currentPage - 1) * ROWS_PER_PAGE + 1).toLocaleString()} -{" "}
-          {Math.min(currentPage * ROWS_PER_PAGE, addresses.length).toLocaleString()}{" "}
-          of {addresses.length.toLocaleString()} addresses
+          {Math.min(currentPage * ROWS_PER_PAGE, displayAddresses.length).toLocaleString()}{" "}
+          of {displayAddresses.length.toLocaleString()} addresses
         </p>
 
         <div className="flex items-center gap-2">
@@ -438,24 +498,80 @@ function annotateAddresses(response: RichListApiResponse): RichListAddress[] {
 function buildCategoryBreakdown(
   addresses: RichListAddress[],
   totalSupply: number,
-  shieldedPool?: number
+  shieldedPool?: number,
+  excludeSwapPools?: boolean
 ) {
   const buckets = new Map<RichListCategory, number>();
   let unknownBalance = 0;
 
+  // FluxNode collateral constants
+  const CUMULUS_COLLATERAL = 1000;
+  const NIMBUS_COLLATERAL = 12500;
+  const STRATUS_COLLATERAL = 40000;
+
+  // Track FluxNode collateral for unknown/retail holders only
+  let cumulusCollateral = 0;
+  let nimbusCollateral = 0;
+  let stratusCollateral = 0;
+
   addresses.forEach((addr) => {
     if (addr.category) {
+      // Exclude swap pool category if requested
+      if (excludeSwapPools && addr.category === 'Swap Pool') {
+        // Skip swap pool addresses when excluding
+        return;
+      }
       buckets.set(
         addr.category,
         (buckets.get(addr.category) || 0) + addr.balance
       );
     } else {
+      // For unknown/retail holders, calculate FluxNode collateral
+      if (addr.cumulusCount) {
+        cumulusCollateral += addr.cumulusCount * CUMULUS_COLLATERAL;
+      }
+      if (addr.nimbusCount) {
+        nimbusCollateral += addr.nimbusCount * NIMBUS_COLLATERAL;
+      }
+      if (addr.stratusCount) {
+        stratusCollateral += addr.stratusCount * STRATUS_COLLATERAL;
+      }
+
       unknownBalance += addr.balance;
     }
   });
 
-  if (unknownBalance > 0) {
-    buckets.set("Unknown", (buckets.get("Unknown") || 0) + unknownBalance);
+  // Subtract FluxNode collateral from unknown balance to avoid double counting
+  const unknownNonNodeBalance = unknownBalance - cumulusCollateral - nimbusCollateral - stratusCollateral;
+
+  if (unknownNonNodeBalance > 0) {
+    buckets.set("Unknown", unknownNonNodeBalance);
+  }
+
+  // Add FluxNode collateral as separate categories
+  if (cumulusCollateral > 0) {
+    buckets.set("Cumulus Nodes" as RichListCategory, cumulusCollateral);
+  }
+  if (nimbusCollateral > 0) {
+    buckets.set("Nimbus Nodes" as RichListCategory, nimbusCollateral);
+  }
+  if (stratusCollateral > 0) {
+    buckets.set("Stratus Nodes" as RichListCategory, stratusCollateral);
+  }
+
+  // Calculate the denominator for percentages
+  // When excluding swap pools: use sum of all non-swap-pool balances (relative distribution)
+  // When including swap pools: use total supply (absolute percentages)
+  let denominator: number;
+  if (excludeSwapPools) {
+    // Sum of all non-swap-pool category balances
+    denominator = Array.from(buckets.values()).reduce((sum, val) => sum + val, 0);
+    // Add shielded pool to denominator if available
+    if (shieldedPool && shieldedPool > 0) {
+      denominator += shieldedPool;
+    }
+  } else {
+    denominator = totalSupply;
   }
 
   const items: Array<{
@@ -467,7 +583,7 @@ function buildCategoryBreakdown(
     .map(([category, value]) => ({
       name: category,
       value,
-      percentage: totalSupply > 0 ? (value / totalSupply) * 100 : 0,
+      percentage: denominator > 0 ? (value / denominator) * 100 : 0,
       color: richListCategoryColors[category],
     }))
     .sort((a, b) => b.value - a.value);
@@ -477,17 +593,35 @@ function buildCategoryBreakdown(
     items.unshift({
       name: "Shielded Pool",
       value: shieldedPool,
-      percentage: totalSupply > 0 ? (shieldedPool / totalSupply) * 100 : 0,
+      percentage: denominator > 0 ? (shieldedPool / denominator) * 100 : 0,
       color: "#8b5cf6", // purple-500 for shielded pool
     });
   }
 
-  const primary = items.slice(0, 6);
-  const remainder = items.slice(6);
+  // Separate FluxNode categories from other categories to ensure they're always shown
+  const fluxNodeCategories = items.filter(item =>
+    item.name === "Cumulus Nodes" ||
+    item.name === "Nimbus Nodes" ||
+    item.name === "Stratus Nodes"
+  );
+  const otherCategories = items.filter(item =>
+    item.name !== "Cumulus Nodes" &&
+    item.name !== "Nimbus Nodes" &&
+    item.name !== "Stratus Nodes"
+  );
+
+  // Take top 6 non-FluxNode categories
+  const primaryOther = otherCategories.slice(0, 6);
+  const remainder = otherCategories.slice(6);
+
+  // Combine primary categories with FluxNode categories
+  const primary = [...primaryOther, ...fluxNodeCategories];
+
+  // Group remaining into "Other" if any
   if (remainder.length > 0) {
     const otherTotal = remainder.reduce((acc, item) => acc + item.value, 0);
     const otherPercentage =
-      totalSupply > 0 ? (otherTotal / totalSupply) * 100 : 0;
+      denominator > 0 ? (otherTotal / denominator) * 100 : 0;
     primary.push({
       name: "Other",
       value: otherTotal,
@@ -519,6 +653,8 @@ interface DistributionProps {
     percentage: number;
     color: string;
   }>;
+  excludeSwapPools: boolean;
+  setExcludeSwapPools: (value: boolean) => void;
 }
 
 function RichListDistribution({
@@ -531,6 +667,8 @@ function RichListDistribution({
   top10Share,
   top100Share,
   breakdown,
+  excludeSwapPools,
+  setExcludeSwapPools,
 }: DistributionProps) {
   const formattedDate = new Date(lastUpdate);
 
@@ -539,10 +677,19 @@ function RichListDistribution({
       <div className="border rounded-lg p-6 bg-card space-y-4 lg:col-span-2">
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-lg font-semibold">Supply Breakdown</h2>
+            <h2 className="text-lg font-semibold">Rich List Supply Breakdown</h2>
             <p className="text-xs text-muted-foreground">
               Balance distribution across known categories
             </p>
+            <label className="flex items-center gap-2 cursor-pointer text-xs text-muted-foreground hover:text-foreground transition-colors mt-2">
+              <input
+                type="checkbox"
+                checked={!excludeSwapPools}
+                onChange={(e) => setExcludeSwapPools(!e.target.checked)}
+                className="rounded border-gray-300 text-primary focus:ring-primary"
+              />
+              <span>Include Parallel Asset Swap Pools</span>
+            </label>
           </div>
           <div className="text-xs text-muted-foreground text-right">
             <div>Block #{lastBlock.toLocaleString()}</div>
@@ -661,7 +808,7 @@ function RichListDistribution({
             </div>
           )}
 
-          <div className="p-3 rounded-lg bg-muted/50 border">
+          <div className="p-3 rounded-lg bg-muted/50 border space-y-2">
             <div className="flex items-center justify-between text-sm">
               <span>Top 10 Addresses</span>
               <span className="font-mono text-primary">
@@ -669,11 +816,13 @@ function RichListDistribution({
               </span>
             </div>
             <p className="text-xs text-muted-foreground">
-              Share of circulating supply held by the top 10 richest addresses.
+              {excludeSwapPools
+                ? "Share of supply held by top 10 addresses (excluding swap pools)."
+                : "Share of circulating supply held by the top 10 richest addresses."}
             </p>
           </div>
 
-          <div className="p-3 rounded-lg bg-muted/50 border">
+          <div className="p-3 rounded-lg bg-muted/50 border space-y-2">
             <div className="flex items-center justify-between text-sm">
               <span>Top 100 Addresses</span>
               <span className="font-mono text-primary">
@@ -681,7 +830,9 @@ function RichListDistribution({
               </span>
             </div>
             <p className="text-xs text-muted-foreground">
-              Cumulative balance of the 100 largest addresses in the rich list.
+              {excludeSwapPools
+                ? "Cumulative balance of top 100 addresses (excluding swap pools)."
+                : "Cumulative balance of the 100 largest addresses in the rich list."}
             </p>
           </div>
         </div>

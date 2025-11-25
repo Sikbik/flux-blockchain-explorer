@@ -210,6 +210,10 @@ export interface AddressInfo {
   unconfirmedTxApperances: number;
   txApperances: number;
   transactions: string[]; // Array of transaction IDs
+  cumulusCount?: number;
+  nimbusCount?: number;
+  stratusCount?: number;
+  fluxnodeLastSync?: string | null;
 }
 
 export interface AddressUTXO {

@@ -10,6 +10,7 @@ import {
   Activity,
   TrendingUp,
   Package,
+  Server,
 } from "lucide-react";
 
 interface AddressOverviewProps {
@@ -24,6 +25,12 @@ export function AddressOverview({ addressInfo }: AddressOverviewProps) {
   const totalVolume = totalReceived + totalSent;
   const receivedPercentage = totalVolume > 0 ? (totalReceived / totalVolume) * 100 : 0;
   const sentPercentage = totalVolume > 0 ? (totalSent / totalVolume) * 100 : 0;
+
+  // FluxNode statistics
+  const cumulusCount = addressInfo.cumulusCount || 0;
+  const nimbusCount = addressInfo.nimbusCount || 0;
+  const stratusCount = addressInfo.stratusCount || 0;
+  const totalNodes = cumulusCount + nimbusCount + stratusCount;
 
   return (
     <div className="space-y-6">
@@ -77,6 +84,65 @@ export function AddressOverview({ addressInfo }: AddressOverviewProps) {
           </div>
         </CardContent>
       </Card>
+
+      {/* FluxNode Information */}
+      {totalNodes > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Server className="h-5 w-5" />
+              FluxNode Operations
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-4">
+              {/* Total Nodes Summary */}
+              <div className="p-4 rounded-lg bg-gradient-to-r from-orange-500/10 to-red-500/10 border border-orange-500/20">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Server className="h-5 w-5 text-orange-500" />
+                    <span className="font-medium">Active FluxNodes</span>
+                  </div>
+                  <span className="text-2xl font-bold">{totalNodes}</span>
+                </div>
+              </div>
+
+              {/* Node Tier Breakdown */}
+              <div className="grid gap-4 md:grid-cols-3">
+                {cumulusCount > 0 && (
+                  <div className="p-4 rounded-lg border border-pink-500/30 bg-pink-500/5">
+                    <div className="flex items-center gap-2 mb-2">
+                      <div className="w-3 h-3 rounded-full bg-pink-500"></div>
+                      <span className="text-sm font-medium text-pink-500">CUMULUS</span>
+                    </div>
+                    <div className="text-2xl font-bold">{cumulusCount}</div>
+                  </div>
+                )}
+
+                {nimbusCount > 0 && (
+                  <div className="p-4 rounded-lg border border-purple-500/30 bg-purple-500/5">
+                    <div className="flex items-center gap-2 mb-2">
+                      <div className="w-3 h-3 rounded-full bg-purple-500"></div>
+                      <span className="text-sm font-medium text-purple-500">NIMBUS</span>
+                    </div>
+                    <div className="text-2xl font-bold">{nimbusCount}</div>
+                  </div>
+                )}
+
+                {stratusCount > 0 && (
+                  <div className="p-4 rounded-lg border border-blue-500/30 bg-blue-500/5">
+                    <div className="flex items-center gap-2 mb-2">
+                      <div className="w-3 h-3 rounded-full bg-blue-500"></div>
+                      <span className="text-sm font-medium text-blue-500">STRATUS</span>
+                    </div>
+                    <div className="text-2xl font-bold">{stratusCount}</div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Activity Breakdown */}
       {totalVolume > 0 && (

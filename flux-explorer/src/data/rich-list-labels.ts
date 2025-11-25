@@ -17,6 +17,9 @@ export type RichListCategory =
   | "Ecosystem"
   | "Exchange"
   | "Shared Nodes"
+  | "Cumulus Nodes"
+  | "Nimbus Nodes"
+  | "Stratus Nodes"
   | "Unknown"
   | "Other";
 
@@ -111,7 +114,7 @@ export const richListLabels: RichListLabelDefinition[] = [
   {
     address: "t1Yum7okNzR5kW84dfgwqB23yy1BCcpHFPq",
     label: "Flux Coinbase Pool",
-    category: "Coinbase Pool",
+    category: "Swap Pool",
     note: "Hot wallet",
   },
   {
@@ -172,7 +175,7 @@ export const richListLabelMap = new Map(
 
 export const richListCategoryColors: Record<RichListCategory, string> = {
   Foundation: "#3b82f6", // blue-500
-  InFlux: "#8b5cf6", // violet-500
+  InFlux: "#f87171", // red-400 (softer red, easier on eyes)
   "Swap Pool": "#f97316", // orange-500
   "Coinbase Pool": "#ec4899", // pink-500
   Listing: "#a855f7", // purple-500
@@ -181,6 +184,9 @@ export const richListCategoryColors: Record<RichListCategory, string> = {
   Ecosystem: "#14b8a6", // teal-500
   Exchange: "#f59e0b", // amber-500
   "Shared Nodes": "#10b981", // emerald-500
+  "Cumulus Nodes": "#ec4899", // pink-500 (matching node tier color)
+  "Nimbus Nodes": "#a855f7", // purple-500 (matching node tier color)
+  "Stratus Nodes": "#3b82f6", // blue-500 (matching node tier color)
   Unknown: "#9ca3af", // gray-400
   Other: "#6b7280", // gray-500
 };

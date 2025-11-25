@@ -1288,6 +1288,10 @@ export class APIServer {
         unconfirmedTxs: 0,
         txs: addressData.tx_count,
         transactions: transactions.rows,
+        cumulusCount: addressData.cumulus_count || 0,
+        nimbusCount: addressData.nimbus_count || 0,
+        stratusCount: addressData.stratus_count || 0,
+        fluxnodeLastSync: addressData.fluxnode_last_sync || null,
       });
     } catch (error: any) {
       logger.error('Failed to get address', { error: error.message });
