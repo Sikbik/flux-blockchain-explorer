@@ -1787,8 +1787,7 @@ export class BlockIndexer {
           received_value,
           sent_value
         ) VALUES ${placeholders}
-        ON CONFLICT (address, txid) DO UPDATE SET
-          block_height   = EXCLUDED.block_height,
+        ON CONFLICT (block_height, address, txid) DO UPDATE SET
           timestamp      = EXCLUDED.timestamp,
           block_hash     = EXCLUDED.block_hash,
           direction      = EXCLUDED.direction,

@@ -1,9 +1,9 @@
 version: '3.8'
 
 services:
-  # PostgreSQL database
+  # TimescaleDB database (PostgreSQL with time-series optimization)
   postgres:
-    image: postgres:15-alpine
+    image: timescale/timescaledb:latest-pg15
     container_name: fluxindexer-postgres
     shm_size: 512m
     environment:

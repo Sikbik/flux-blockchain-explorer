@@ -8,9 +8,9 @@
 version: '3.8'
 
 services:
-  # PostgreSQL Database
+  # TimescaleDB Database (PostgreSQL with time-series optimization)
   postgres:
-    image: postgres:15-alpine
+    image: timescale/timescaledb:latest-pg15
     container_name: fluxindexer-postgres-prod
     shm_size: 1g
     environment:
@@ -19,14 +19,18 @@ services:
       POSTGRES_PASSWORD: CHANGE_THIS_PASSWORD  # Replace with your secure PostgreSQL password
     command: >
       postgres
-      -c shared_buffers=2GB
-      -c effective_cache_size=8GB
-      -c maintenance_work_mem=512MB
-      -c work_mem=32MB
+      -c shared_buffers=4GB
+      -c effective_cache_size=12GB
+      -c maintenance_work_mem=1GB
+      -c work_mem=64MB
       -c max_connections=100
       -c checkpoint_completion_target=0.9
-      -c wal_buffers=16MB
+      -c wal_buffers=64MB
       -c random_page_cost=1.1
+      -c timescaledb.max_background_workers=8
+      -c max_worker_processes=16
+      -c max_parallel_workers_per_gather=4
+      -c max_parallel_workers=8
     ports:
       - "127.0.0.1:5432:5432"  # Only expose locally for security
     volumes:
