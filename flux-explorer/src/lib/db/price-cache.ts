@@ -214,6 +214,26 @@ export function batchSetPrices(prices: [number, number][]): void {
 }
 
 /**
+ * Get prices for a timestamp range
+ *
+ * @param startTimestamp - Start Unix timestamp (seconds)
+ * @param endTimestamp - End Unix timestamp (seconds)
+ * @returns Array of { timestamp, price_usd }
+ */
+export function getPricesByRange(startTimestamp: number, endTimestamp: number): Array<{ timestamp: number; price_usd: number }> {
+  const database = initPriceCache();
+
+  const rows = database.prepare(`
+    SELECT timestamp, price_usd
+    FROM price_history
+    WHERE timestamp >= ? AND timestamp <= ?
+    ORDER BY timestamp ASC
+  `).all(startTimestamp, endTimestamp) as Array<{ timestamp: number; price_usd: number }>;
+
+  return rows;
+}
+
+/**
  * Get date range that needs to be populated
  *
  * @returns { oldestTimestamp, newestTimestamp, count }
