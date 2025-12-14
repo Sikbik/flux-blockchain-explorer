@@ -67,6 +67,10 @@ COPY --from=builder --chown=nextjs:nodejs /app/src ./src
 # Copy node_modules with tsx and dependencies (needed for background price population)
 COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 
+# Copy entrypoint script with correct permissions for nextjs user
+COPY --from=builder /app/docker/entrypoint.sh /entrypoint.sh
+RUN chmod 755 /entrypoint.sh && chown nextjs:nodejs /entrypoint.sh
+
 # Create data directory for SQLite database
 RUN mkdir -p data && chown nextjs:nodejs data
 
@@ -80,5 +84,5 @@ EXPOSE 42069
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
   CMD node -e "require('http').get('http://127.0.0.1:42069', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
 
-# Start application
-CMD ["node", "server.js"]
+# Start application with entrypoint that handles price population
+ENTRYPOINT ["/entrypoint.sh"]

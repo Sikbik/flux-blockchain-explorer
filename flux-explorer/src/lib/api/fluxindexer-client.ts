@@ -860,14 +860,11 @@ export class FluxIndexerAPI {
         limit: pageSize.toString(),
       };
 
-      // Use cursor-based pagination if cursor is provided
+      // Use cursor-based pagination if cursor is provided (works with timestamp filters too)
       if (params?.cursorHeight !== undefined && params?.cursorTxid) {
         searchParams.cursorHeight = params.cursorHeight.toString();
         searchParams.cursorTxid = params.cursorTxid;
-      }
-      // Fall back to offset-based for CSV exports with timestamp filters
-      else if (params?.fromTimestamp !== undefined || params?.toTimestamp !== undefined) {
-        searchParams.offset = from.toString();
+        // Don't use offset when cursor is provided
       }
       // For regular pagination without cursor, use offset (will be slower for large offsets)
       else {

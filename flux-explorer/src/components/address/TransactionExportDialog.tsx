@@ -113,38 +113,46 @@ export function TransactionExportDialog({
       const fromTimestamp = Math.floor(dateRange.from.getTime() / 1000);
       const toTimestamp = Math.floor(dateRange.to.getTime() / 1000);
 
-      const batchSize = 10000; // Fetch up to 10000 transactions per batch for faster exports
+      // Use moderate batch size with cursor-based pagination for efficiency
+      // ClickHouse handles cursor pagination well, 2000 is a good balance
+      const batchSize = 2000;
       let allTransactions: AddressTransactionSummary[] = [];
-      let offset = 0;
+      let cursor: { height: number; txid: string } | undefined;
       let hasMore = true;
+      let totalEstimate = 0;
 
-      // Step 1: Fetch all transactions in the date range
+      // Step 1: Fetch all transactions in the date range using cursor pagination
       while (hasMore) {
-        // Fetch batch from API using FluxAPI client
+        // Fetch batch from API using cursor-based pagination
         const data = await FluxAPI.getAddressTransactions([address], {
-          from: offset,
-          to: offset + batchSize,
+          from: 0,
+          to: batchSize,
           fromTimestamp,
           toTimestamp,
+          cursorHeight: cursor?.height,
+          cursorTxid: cursor?.txid,
         });
 
         const items = data.items || [];
         allTransactions = allTransactions.concat(items);
 
-        offset += items.length; // Increment by actual items received
+        // Update cursor for next batch
+        cursor = data.nextCursor;
+
         setFetchedCount(allTransactions.length);
 
         // Update target count based on filteredTotal from first response
-        if (targetCount === 0 && data.filteredTotal) {
+        if (totalEstimate === 0 && data.filteredTotal) {
+          totalEstimate = data.filteredTotal;
           setTargetCount(data.filteredTotal);
         }
 
         // Calculate progress (first 50% is fetching transactions)
-        const estimatedTotal = data.filteredTotal || allTransactions.length;
+        const estimatedTotal = totalEstimate || allTransactions.length;
         setProgress((allTransactions.length / Math.max(estimatedTotal, 1)) * 50);
 
-        // Break if we've received fewer transactions than requested (end of data)
-        if (items.length === 0 || items.length < batchSize || allTransactions.length >= (data.filteredTotal || 0)) {
+        // Break if no more results or no next cursor
+        if (items.length === 0 || !cursor || allTransactions.length >= (totalEstimate || Infinity)) {
           hasMore = false;
         }
       }
@@ -157,22 +165,40 @@ export function TransactionExportDialog({
 
       // Step 2: Fetch price data for all transactions (second 50% of progress)
       setCurrentStatus("Fetching price data...");
-      const timestamps = allTransactions.map(tx => tx.timestamp).filter(ts => ts > 0);
 
-      // Batch price fetching with progress updates (chunks of 1000 timestamps)
+      // De-duplicate timestamps by hour (same hour = same price lookup)
+      // This dramatically reduces API calls for active addresses
+      const hourlyTimestamps = allTransactions
+        .map(tx => tx.timestamp)
+        .filter(ts => ts > 0)
+        .map(ts => Math.floor(ts / 3600) * 3600); // Round to hour
+      const uniqueTimestamps = Array.from(new Set(hourlyTimestamps));
+
+      // Fetch prices in parallel batches for speed
       const priceMap = new Map<number, number | null>();
-      const priceChunkSize = 1000;
+      const priceChunkSize = 1000; // Max per API call
+      const parallelBatches = 5; // Fetch 5 batches in parallel
 
-      for (let i = 0; i < timestamps.length; i += priceChunkSize) {
-        const chunk = timestamps.slice(i, i + priceChunkSize);
-        const chunkResults = await batchGetFluxPrices(chunk);
+      const chunks: number[][] = [];
+      for (let i = 0; i < uniqueTimestamps.length; i += priceChunkSize) {
+        chunks.push(uniqueTimestamps.slice(i, i + priceChunkSize));
+      }
 
-        // Merge results into main map
-        chunkResults.forEach((price, timestamp) => priceMap.set(timestamp, price));
+      // Process chunks in parallel groups
+      for (let i = 0; i < chunks.length; i += parallelBatches) {
+        const batchGroup = chunks.slice(i, i + parallelBatches);
+        const results = await Promise.all(
+          batchGroup.map(chunk => batchGetFluxPrices(chunk))
+        );
+
+        // Merge all results into priceMap
+        results.forEach(chunkResults => {
+          chunkResults.forEach((price, timestamp) => priceMap.set(timestamp, price));
+        });
 
         // Update progress (50% to 75% range)
-        const chunkProgress = Math.min(i + priceChunkSize, timestamps.length);
-        setProgress(50 + (chunkProgress / timestamps.length) * 25);
+        const processedChunks = Math.min(i + parallelBatches, chunks.length);
+        setProgress(50 + (processedChunks / chunks.length) * 25);
       }
 
       // Step 3: Split into multiple files if needed (100K transactions per file)
@@ -266,8 +292,9 @@ export function TransactionExportDialog({
       const amount = Math.abs(tx.value).toFixed(8);
       const currency = "FLUX";
 
-      // Get price at transaction time
-      const price = tx.timestamp ? (priceMap.get(tx.timestamp) ?? null) : null;
+      // Get price at transaction time (rounded to hour for lookup)
+      const hourTimestamp = tx.timestamp ? Math.floor(tx.timestamp / 3600) * 3600 : 0;
+      const price = hourTimestamp ? (priceMap.get(hourTimestamp) ?? null) : null;
       const priceStr = price !== null ? price.toFixed(6) : "";
       const valueUsd = price !== null ? (Math.abs(tx.value) * price).toFixed(2) : "";
 

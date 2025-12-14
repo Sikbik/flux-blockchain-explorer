@@ -995,14 +995,19 @@ export class ClickHouseAPIServer {
   private async getAddressTransactions(req: Request, res: Response): Promise<void> {
     try {
       const { address } = req.params;
-      const limit = Math.min(parseInt(req.query.limit as string) || 25, 100);
+      // Allow higher limit for CSV exports (up to 10000), default 25 for normal pagination
+      const limit = Math.min(parseInt(req.query.limit as string) || 25, 10000);
       const offset = parseInt(req.query.offset as string) || 0;
 
       // Cursor-based pagination (efficient for ClickHouse - no OFFSET scanning)
       const cursorHeight = req.query.cursorHeight ? parseInt(req.query.cursorHeight as string) : undefined;
       const cursorTxid = req.query.cursorTxid as string | undefined;
 
-      // Build query with optional cursor
+      // Timestamp filtering for date range exports
+      const fromTimestamp = req.query.fromTimestamp ? parseInt(req.query.fromTimestamp as string) : undefined;
+      const toTimestamp = req.query.toTimestamp ? parseInt(req.query.toTimestamp as string) : undefined;
+
+      // Build query with optional cursor and timestamp filters
       let whereClause = 'address = {address:String} AND is_valid = 1';
       const params: Record<string, any> = { address };
 
@@ -1012,6 +1017,16 @@ export class ClickHouseAPIServer {
         whereClause += ` AND (block_height < {cursorHeight:UInt32} OR (block_height = {cursorHeight:UInt32} AND txid > {cursorTxid:FixedString(64)}))`;
         params.cursorHeight = cursorHeight;
         params.cursorTxid = cursorTxid.padStart(64, '0');
+      }
+
+      // Add timestamp range filtering
+      if (fromTimestamp !== undefined) {
+        whereClause += ` AND timestamp >= {fromTimestamp:UInt32}`;
+        params.fromTimestamp = fromTimestamp;
+      }
+      if (toTimestamp !== undefined) {
+        whereClause += ` AND timestamp <= {toTimestamp:UInt32}`;
+        params.toTimestamp = toTimestamp;
       }
 
       // Step 1: Get address transactions - use GROUP BY to deduplicate without expensive FINAL
@@ -1057,12 +1072,20 @@ export class ClickHouseAPIServer {
         return { ...at, fee: td.fee, input_total: td.input_total, output_total: td.output_total };
       });
 
-      // Get total count - use uniqExact() for accurate count without expensive FINAL
-      const totalResult = await this.ch.queryOne<{ count: number }>(`
-        SELECT uniqExact(txid, block_height) as count
-        FROM address_transactions
-        WHERE address = {address:String} AND is_valid = 1
-      `, { address });
+      // Get total count (unfiltered) and filtered count (with timestamp range)
+      // Use same whereClause for filtered count to respect timestamp filters
+      const [totalResult, filteredResult] = await Promise.all([
+        this.ch.queryOne<{ count: number }>(`
+          SELECT uniqExact(txid, block_height) as count
+          FROM address_transactions
+          WHERE address = {address:String} AND is_valid = 1
+        `, { address }),
+        this.ch.queryOne<{ count: number }>(`
+          SELECT uniqExact(txid, block_height) as count
+          FROM address_transactions
+          WHERE ${whereClause}
+        `, params),
+      ]);
 
       // Build next cursor if there are more results
       let nextCursor: { height: number; txid: string } | undefined;
@@ -1126,7 +1149,7 @@ export class ClickHouseAPIServer {
           };
         }),
         total: Number(totalResult?.count ?? 0),
-        filteredTotal: Number(totalResult?.count ?? 0),
+        filteredTotal: Number(filteredResult?.count ?? totalResult?.count ?? 0),
         limit,
         offset: cursorHeight !== undefined ? 0 : offset,
         nextCursor,
