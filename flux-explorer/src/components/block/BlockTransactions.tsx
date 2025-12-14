@@ -59,7 +59,7 @@ function summarizeCounts(block: Block) {
   const summary = block.txSummary;
   if (summary) {
     return {
-      regular: summary.regular,
+      regular: summary.regular + (summary.coinbase || 0),
       nodeConfirmations: summary.fluxnodeConfirm,
       tierCounts: summary.tierCounts,
     };

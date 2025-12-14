@@ -82,7 +82,8 @@ export interface BlockInsert {
 
 export async function bulkInsertBlocks(
   ch: ClickHouseConnection,
-  blocks: BlockInsert[]
+  blocks: BlockInsert[],
+  options?: { sync?: boolean }
 ): Promise<number> {
   if (blocks.length === 0) return 0;
 
@@ -106,7 +107,12 @@ export async function bulkInsertBlocks(
     _version: version,
   }));
 
-  await ch.insert('blocks', rows);
+  // Use sync insert when near chain tip for immediate visibility
+  if (options?.sync) {
+    await ch.syncInsert('blocks', rows);
+  } else {
+    await ch.insert('blocks', rows);
+  }
   return blocks.length;
 }
 
@@ -136,7 +142,8 @@ export interface TransactionInsert {
 
 export async function bulkInsertTransactions(
   ch: ClickHouseConnection,
-  transactions: TransactionInsert[]
+  transactions: TransactionInsert[],
+  options?: { sync?: boolean }
 ): Promise<number> {
   if (transactions.length === 0) return 0;
 
@@ -164,8 +171,12 @@ export async function bulkInsertTransactions(
   }));
 
   // Insert transactions
-  // NOTE: tx_lookup table removed - bloom filter index on txid is sufficient
-  await ch.insert('transactions', txRows);
+  // Use sync insert when near chain tip for immediate visibility
+  if (options?.sync) {
+    await ch.syncInsert('transactions', txRows);
+  } else {
+    await ch.insert('transactions', txRows);
+  }
 
   return transactions.length;
 }
@@ -340,7 +351,8 @@ export interface AddressTransactionInsert {
 
 export async function bulkInsertAddressTransactions(
   ch: ClickHouseConnection,
-  records: AddressTransactionInsert[]
+  records: AddressTransactionInsert[],
+  options?: { sync?: boolean }
 ): Promise<number> {
   if (records.length === 0) return 0;
 
@@ -367,7 +379,12 @@ export async function bulkInsertAddressTransactions(
     };
   });
 
-  await ch.insert('address_transactions', rows);
+  // Use sync insert when near chain tip for immediate visibility
+  if (options?.sync) {
+    await ch.syncInsert('address_transactions', rows);
+  } else {
+    await ch.insert('address_transactions', rows);
+  }
   return records.length;
 }
 

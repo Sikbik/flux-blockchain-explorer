@@ -51,9 +51,9 @@ export function BlockVisual({ block }: BlockVisualProps) {
               <Skeleton className="h-4 w-32" />
             ) : (
               <div className="flex items-center gap-2">
-                {summary && summary.regular > 0 && (
+                {summary && (summary.regular + (summary.coinbase || 0)) > 0 && (
                   <span className="text-muted-foreground">
-                    {summary.regular} transaction{summary.regular !== 1 ? "s" : ""}
+                    {summary.regular + (summary.coinbase || 0)} transaction{(summary.regular + (summary.coinbase || 0)) !== 1 ? "s" : ""}
                   </span>
                 )}
                 {summary && (summary.fluxnodeConfirm + summary.fluxnodeStart + summary.fluxnodeOther) > 0 && (

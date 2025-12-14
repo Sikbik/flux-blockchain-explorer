@@ -369,8 +369,9 @@ export class ClickHouseBlockIndexer {
    * @param startHeight - Starting height for the batch
    * @param options - Optional settings:
    *   - syncFluxnodeInsert: Use synchronous insert for fluxnode_transactions for immediate visibility
+   *   - syncInsert: Use synchronous inserts for all tables (blocks, transactions, address_transactions)
    */
-  async indexBlocksBatch(blocks: Block[], startHeight: number, options?: { syncFluxnodeInsert?: boolean }): Promise<number> {
+  async indexBlocksBatch(blocks: Block[], startHeight: number, options?: { syncFluxnodeInsert?: boolean; syncInsert?: boolean }): Promise<number> {
     if (blocks.length === 0) return 0;
 
     const startTime = Date.now();
@@ -1076,17 +1077,19 @@ export class ClickHouseBlockIndexer {
     }
 
     // Now do bulk inserts into ClickHouse
+    // Use sync inserts when syncInsert option is set (tip-following mode)
     const timings: Record<string, number> = {};
+    const useSync = options?.syncInsert ?? false;
     let t0 = Date.now();
 
-    await bulkInsertBlocks(this.ch, blockRecords);
+    await bulkInsertBlocks(this.ch, blockRecords, { sync: useSync });
     timings.blocks = Date.now() - t0; t0 = Date.now();
 
-    await bulkInsertTransactions(this.ch, txRecords);
+    await bulkInsertTransactions(this.ch, txRecords, { sync: useSync });
     timings.txs = Date.now() - t0; t0 = Date.now();
 
     if (fluxnodeRecords.length > 0) {
-      const useSync = options?.syncFluxnodeInsert ?? false;
+      const useSyncFluxnode = options?.syncFluxnodeInsert ?? useSync;
       logger.info('Inserting FluxNode transaction records', {
         count: fluxnodeRecords.length,
         startHeight,
@@ -1094,9 +1097,9 @@ export class ClickHouseBlockIndexer {
         firstTxid: fluxnodeRecords[0]?.txid?.slice(0, 16),
         firstTier: fluxnodeRecords[0]?.benchmarkTier,
         firstIp: fluxnodeRecords[0]?.ipAddress,
-        syncInsert: useSync,
+        syncInsert: useSyncFluxnode,
       });
-      await bulkInsertFluxnodeTransactions(this.ch, fluxnodeRecords, { sync: useSync });
+      await bulkInsertFluxnodeTransactions(this.ch, fluxnodeRecords, { sync: useSyncFluxnode });
       timings.fluxnode = Date.now() - t0; t0 = Date.now();
     }
 
@@ -1139,7 +1142,7 @@ export class ClickHouseBlockIndexer {
         sent: r.sent,
         isCoinbase: r.isCoinbase,
       }));
-      await bulkInsertAddressTransactions(this.ch, addressTxRecords);
+      await bulkInsertAddressTransactions(this.ch, addressTxRecords, { sync: useSync });
       timings.addrTx = Date.now() - t0; t0 = Date.now();
     }
 
@@ -1316,7 +1319,7 @@ export class ClickHouseBlockIndexer {
   /**
    * Process a single block
    */
-  private async processBlock(block: Block, expectedHeight?: number, options?: { syncFluxnodeInsert?: boolean }): Promise<void> {
+  private async processBlock(block: Block, expectedHeight?: number, options?: { syncFluxnodeInsert?: boolean; syncInsert?: boolean }): Promise<void> {
     const blockHeight = block.height ?? expectedHeight;
     if (blockHeight === undefined) {
       throw new SyncError('Block height is undefined', { blockHash: block.hash });
@@ -1327,8 +1330,11 @@ export class ClickHouseBlockIndexer {
     await this.normalizeBlockTransactions(block);
 
     // Process as a single-block batch
-    // Use sync insert for fluxnode data when processing single blocks (tip-following mode)
-    await this.indexBlocksBatch([block], blockHeight, { syncFluxnodeInsert: options?.syncFluxnodeInsert ?? true });
+    // Use sync inserts when processing single blocks (tip-following mode) for immediate visibility
+    await this.indexBlocksBatch([block], blockHeight, {
+      syncFluxnodeInsert: options?.syncFluxnodeInsert ?? true,
+      syncInsert: options?.syncInsert ?? true
+    });
 
     // Update producer stats if applicable
     if (block.producer) {

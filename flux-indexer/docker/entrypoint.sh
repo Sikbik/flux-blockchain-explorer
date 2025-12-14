@@ -244,9 +244,9 @@ bootstrap_clickhouse() {
   # First, ensure the database exists
   ch_client --query="CREATE DATABASE IF NOT EXISTS $CH_DATABASE" 2>/dev/null || true
 
-  # Run RESTORE command with allow_non_empty_tables for idempotency
+  # Run RESTORE command - backup uses 'default' database, restore as target database
   # The path must be as seen by ClickHouse server, not the indexer container
-  local restore_query="RESTORE DATABASE $CH_DATABASE FROM File('$ch_restore_path') SETTINGS allow_non_empty_tables=true"
+  local restore_query="RESTORE DATABASE default AS $CH_DATABASE FROM File('$ch_restore_path') SETTINGS allow_non_empty_tables=true"
 
   if ch_client --query="$restore_query" 2>&1; then
     echo "[ClickHouse Bootstrap] Database restored successfully!"
@@ -529,6 +529,31 @@ else
   echo ""
   echo "[Daemon Bootstrap] No BOOTSTRAP_URL set - will sync from genesis or use existing data"
 fi
+
+# Regenerate flux.conf to ensure our credentials are used (bootstrap may include different config)
+cat > /home/flux/.flux/flux.conf << EOF
+server=1
+rpcuser=${FLUX_RPC_USER}
+rpcpassword=${FLUX_RPC_PASSWORD}
+rpcport=16124
+rpcallowip=127.0.0.1
+rpcallowip=172.0.0.0/8
+rpcallowip=::1
+addressindex=1
+timestampindex=1
+spentindex=1
+txindex=0
+dbcache=1024
+maxmempool=512
+listen=0
+listenonion=0
+printtoconsole=1
+logips=1
+logtimestamps=1
+disablewallet=1
+rpcwarmup=1
+EOF
+chown flux:flux /home/flux/.flux/flux.conf
 
 #######################################
 # SECTION 5: Start Services
