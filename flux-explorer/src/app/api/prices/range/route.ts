@@ -10,6 +10,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getPricesByRange, getPriceDataRange } from "@/lib/db/price-cache";
 
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+export async function OPTIONS() {
+  return NextResponse.json({}, { headers: corsHeaders });
+}
+
 /**
  * GET /api/prices/range
  *
@@ -28,7 +38,7 @@ export async function GET(request: NextRequest) {
     if (!startParam || !endParam) {
       return NextResponse.json(
         { error: "Missing required parameters: start and end" },
-        { status: 400 }
+        { status: 400, headers: corsHeaders }
       );
     }
 
@@ -45,7 +55,7 @@ export async function GET(request: NextRequest) {
     } else {
       return NextResponse.json(
         { error: "Invalid start format. Use YYYY-MM-DD or Unix timestamp." },
-        { status: 400 }
+        { status: 400, headers: corsHeaders }
       );
     }
 
@@ -58,7 +68,7 @@ export async function GET(request: NextRequest) {
     } else {
       return NextResponse.json(
         { error: "Invalid end format. Use YYYY-MM-DD or Unix timestamp." },
-        { status: 400 }
+        { status: 400, headers: corsHeaders }
       );
     }
 
@@ -66,7 +76,7 @@ export async function GET(request: NextRequest) {
     if (startTimestamp > endTimestamp) {
       return NextResponse.json(
         { error: "Start date must be before end date" },
-        { status: 400 }
+        { status: 400, headers: corsHeaders }
       );
     }
 
@@ -75,7 +85,7 @@ export async function GET(request: NextRequest) {
     if (endTimestamp - startTimestamp > maxRange) {
       return NextResponse.json(
         { error: "Maximum range is 2 years per request" },
-        { status: 400 }
+        { status: 400, headers: corsHeaders }
       );
     }
 
@@ -110,13 +120,13 @@ export async function GET(request: NextRequest) {
           totalPrices: dataRange.count,
         },
       },
-    });
+    }, { headers: corsHeaders });
 
   } catch (error) {
     console.error("Error in price range fetch:", error);
     return NextResponse.json(
       { error: "Internal server error" },
-      { status: 500 }
+      { status: 500, headers: corsHeaders }
     );
   }
 }
