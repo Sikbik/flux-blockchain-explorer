@@ -8,6 +8,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCachedPriceByTimestamp } from "@/lib/db/price-cache";
 
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+export async function OPTIONS() {
+  return NextResponse.json({}, { headers: corsHeaders });
+}
+
 /**
  * POST /api/prices/batch
  *
@@ -21,7 +31,7 @@ export async function POST(request: NextRequest) {
     if (!Array.isArray(timestamps)) {
       return NextResponse.json(
         { error: "Invalid request: timestamps must be an array" },
-        { status: 400 }
+        { status: 400, headers: corsHeaders }
       );
     }
 
@@ -30,7 +40,7 @@ export async function POST(request: NextRequest) {
     if (timestamps.length > MAX_TIMESTAMPS) {
       return NextResponse.json(
         { error: `Maximum ${MAX_TIMESTAMPS} timestamps allowed per request` },
-        { status: 400 }
+        { status: 400, headers: corsHeaders }
       );
     }
 
@@ -39,7 +49,7 @@ export async function POST(request: NextRequest) {
       if (!Number.isFinite(ts) || ts <= 0) {
         return NextResponse.json(
           { error: "All timestamps must be positive finite numbers" },
-          { status: 400 }
+          { status: 400, headers: corsHeaders }
         );
       }
     }
@@ -60,13 +70,13 @@ export async function POST(request: NextRequest) {
       console.warn(`Missing prices may indicate price database needs updating. Run: npm run update-prices`);
     }
 
-    return NextResponse.json({ prices: results });
+    return NextResponse.json({ prices: results }, { headers: corsHeaders });
 
   } catch (error) {
     console.error("Error in batch price fetch:", error);
     return NextResponse.json(
       { error: "Internal server error" },
-      { status: 500 }
+      { status: 500, headers: corsHeaders }
     );
   }
 }
