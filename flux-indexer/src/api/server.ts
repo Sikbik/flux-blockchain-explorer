@@ -411,7 +411,15 @@ export class ClickHouseAPIServer {
         chain_height: number;
         is_syncing: number;
         sync_percentage: number;
-      }>('SELECT current_height, chain_height, is_syncing, sync_percentage FROM sync_state FINAL WHERE id = 1');
+      }>(`
+        SELECT
+          argMax(current_height, updated_at) as current_height,
+          argMax(chain_height, updated_at) as chain_height,
+          argMax(is_syncing, updated_at) as is_syncing,
+          argMax(sync_percentage, updated_at) as sync_percentage
+        FROM sync_state
+        WHERE id = 1
+      `);
 
       // Use uniqExact() for accurate counts without expensive FINAL
       // This counts unique primary key combinations without full table deduplication
@@ -422,7 +430,7 @@ export class ClickHouseAPIServer {
 
       const currentHeight = syncState?.current_height ?? 0;
       const chainHeight = chainInfo?.headers ?? syncState?.chain_height ?? 0;
-      const synced = currentHeight >= chainHeight - 1;
+      const synced = chainHeight > 0 ? currentHeight >= chainHeight : false;
       const percentage = syncState?.sync_percentage ?? (chainHeight > 0 ? (currentHeight / chainHeight) * 100 : 0);
 
       // Response format expected by frontend (FluxIndexerApiResponse)
@@ -479,7 +487,16 @@ export class ClickHouseAPIServer {
         sync_percentage: number;
         is_syncing: number;
         blocks_per_second: number;
-      }>('SELECT * FROM sync_state FINAL WHERE id = 1');
+      }>(`
+        SELECT
+          argMax(current_height, updated_at) as current_height,
+          argMax(chain_height, updated_at) as chain_height,
+          argMax(sync_percentage, updated_at) as sync_percentage,
+          argMax(is_syncing, updated_at) as is_syncing,
+          argMax(blocks_per_second, updated_at) as blocks_per_second
+        FROM sync_state
+        WHERE id = 1
+      `);
 
       const currentHeight = syncState?.current_height ?? 0;
       const chainHeight = syncState?.chain_height ?? 0;
@@ -490,7 +507,7 @@ export class ClickHouseAPIServer {
       res.json({
         indexer: {
           syncing: isSyncing,
-          synced: currentHeight >= chainHeight - 1,
+          synced: chainHeight > 0 ? currentHeight >= chainHeight : false,
           currentHeight,
           chainHeight,
           progress: `${currentHeight}/${chainHeight}`,

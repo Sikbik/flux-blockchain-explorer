@@ -342,7 +342,7 @@ export class ClickHouseBlockIndexer {
   /**
    * Index a single block
    */
-  async indexBlock(height: number): Promise<void> {
+  async indexBlock(height: number, chainHeight?: number): Promise<void> {
     try {
       let block: Block;
       try {
@@ -413,7 +413,7 @@ export class ClickHouseBlockIndexer {
         block = fallbackBlock;
       }
 
-      await this.processBlock(block, height);
+      await this.processBlock(block, height, { chainHeight });
       logger.debug(`Indexed block ${height} (${block.hash})`);
     } catch (error: any) {
       logger.error(`Failed to index block ${height}`, { error: error.message });
@@ -442,7 +442,11 @@ export class ClickHouseBlockIndexer {
    *   - syncFluxnodeInsert: Use synchronous insert for fluxnode_transactions for immediate visibility
    *   - syncInsert: Use synchronous inserts for all tables (blocks, transactions, address_transactions)
    */
-  async indexBlocksBatch(blocks: Block[], startHeight: number, options?: { syncFluxnodeInsert?: boolean; syncInsert?: boolean }): Promise<number> {
+  async indexBlocksBatch(
+    blocks: Block[],
+    startHeight: number,
+    options?: { syncFluxnodeInsert?: boolean; syncInsert?: boolean; chainHeight?: number }
+  ): Promise<number> {
     if (blocks.length === 0) return 0;
 
     const startTime = Date.now();
@@ -1456,18 +1460,27 @@ export class ClickHouseBlockIndexer {
 
     await this.updateProducerStatsBatch(producerBlocks);
 
-    // Update sync state to last block
-    const lastBlock = blocks[blocks.length - 1];
-    if (lastBlock) {
-      await updateSyncState(this.ch, {
-        currentHeight: startHeight + blocks.length - 1,
-        chainHeight: 0, // Updated separately
-        syncPercentage: 0,
-        lastBlockHash: lastBlock.hash,
-        isSyncing: true,
-        blocksPerSecond: blocks.length / ((Date.now() - startTime) / 1000),
-      });
-    }
+	    // Update sync state to last block
+	    const lastBlock = blocks[blocks.length - 1];
+	    if (lastBlock) {
+	      const currentHeight = startHeight + blocks.length - 1;
+
+	      let chainHeight = options?.chainHeight;
+	      if (chainHeight === undefined || chainHeight <= 0) {
+	        const state = await this.getSyncState();
+	        chainHeight = state.chainHeight;
+	      }
+
+	      const syncPercentage = chainHeight > 0 ? (currentHeight / chainHeight) * 100 : 0;
+	      await updateSyncState(this.ch, {
+	        currentHeight,
+	        chainHeight,
+	        syncPercentage,
+	        lastBlockHash: lastBlock.hash,
+	        isSyncing: true,
+	        blocksPerSecond: blocks.length / ((Date.now() - startTime) / 1000),
+	      });
+	    }
 
     const elapsed = Date.now() - startTime;
     logger.debug(`Batch indexed ${blocks.length} blocks in ${elapsed}ms (${(blocks.length / (elapsed / 1000)).toFixed(1)} blocks/sec)`);
@@ -1491,7 +1504,11 @@ export class ClickHouseBlockIndexer {
   /**
    * Process a single block
    */
-  private async processBlock(block: Block, expectedHeight?: number, options?: { syncFluxnodeInsert?: boolean; syncInsert?: boolean }): Promise<void> {
+  private async processBlock(
+    block: Block,
+    expectedHeight?: number,
+    options?: { syncFluxnodeInsert?: boolean; syncInsert?: boolean; chainHeight?: number }
+  ): Promise<void> {
     const blockHeight = block.height ?? expectedHeight;
     if (blockHeight === undefined) {
       throw new SyncError('Block height is undefined', { blockHash: block.hash });
@@ -1505,7 +1522,8 @@ export class ClickHouseBlockIndexer {
     // Use sync inserts when processing single blocks (tip-following mode) for immediate visibility
     await this.indexBlocksBatch([block], blockHeight, {
       syncFluxnodeInsert: options?.syncFluxnodeInsert ?? true,
-      syncInsert: options?.syncInsert ?? true
+      syncInsert: options?.syncInsert ?? true,
+      chainHeight: options?.chainHeight,
     });
 
     // Update producer stats if applicable

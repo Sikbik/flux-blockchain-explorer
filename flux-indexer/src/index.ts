@@ -233,11 +233,19 @@ class ClickHouseFluxIndexer {
 
     logger.info(`Found ${missingHeights.length} missing blocks`);
 
+    let chainHeight: number | undefined;
+    try {
+      const chainInfo = await this.rpc.getBlockchainInfo();
+      chainHeight = chainInfo.headers;
+    } catch {
+      // Daemon may not be ready yet; backfill will fail anyway if blocks can't be fetched.
+    }
+
     const blockIndexer = this.syncEngine.getBlockIndexer();
     for (const height of missingHeights) {
       try {
         logger.info(`Backfilling block ${height}...`);
-        await blockIndexer.indexBlock(height);
+        await blockIndexer.indexBlock(height, chainHeight);
         logger.info(`Successfully backfilled block ${height}`);
       } catch (error: any) {
         logger.error(`Failed to backfill block ${height}`, { error: error.message });
