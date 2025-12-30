@@ -58,6 +58,15 @@ interface FluxIndexerTransaction {
   valueIn?: string;
   fees?: string;
   hex?: string;
+  // FluxNode transaction fields (Flux tx versions 5/6)
+  nType?: number | null;
+  benchmarkTier?: string | null;
+  ip?: string | null;
+  fluxnodePubKey?: string | null;
+  sig?: string | null;
+  collateralOutputHash?: string | null;
+  collateralOutputIndex?: number | null;
+  p2shAddress?: string | null;
 }
 
 interface FluxIndexerBlock {
@@ -134,8 +143,24 @@ interface FluxIndexerAddress {
  * FluxIndexer returns values as satoshi strings
  */
 export function satoshisToFlux(satoshis: string | number): number {
-  const value = typeof satoshis === 'string' ? parseInt(satoshis) : satoshis;
-  return value / 100000000;
+  if (typeof satoshis === 'number') {
+    return satoshis / 100000000;
+  }
+
+  const trimmed = satoshis.trim();
+  if (trimmed === '') {
+    return 0;
+  }
+
+  const isNegative = trimmed.startsWith('-');
+  const absValue = BigInt(isNegative ? trimmed.slice(1) : trimmed);
+
+  const satoshisPerFlux = BigInt(100000000);
+  const whole = absValue / satoshisPerFlux;
+  const fractional = absValue % satoshisPerFlux;
+
+  const value = Number(whole) + (Number(fractional) / 1e8);
+  return isNegative ? -value : value;
 }
 
 /**
@@ -217,6 +242,14 @@ export function convertFluxIndexerTransaction(bbTx: FluxIndexerTransaction): Tra
     vsize: computedVSize,
     valueIn: bbTx.valueIn ? satoshisToFlux(bbTx.valueIn) : 0,
     fees: bbTx.fees ? satoshisToFlux(bbTx.fees) : 0,
+    ...(bbTx.nType !== undefined ? { nType: bbTx.nType } : {}),
+    ...(bbTx.benchmarkTier !== undefined ? { benchmarkTier: bbTx.benchmarkTier } : {}),
+    ...(bbTx.ip !== undefined ? { ip: bbTx.ip } : {}),
+    ...(bbTx.fluxnodePubKey !== undefined ? { fluxnodePubKey: bbTx.fluxnodePubKey } : {}),
+    ...(bbTx.sig !== undefined ? { sig: bbTx.sig } : {}),
+    ...(bbTx.collateralOutputHash !== undefined ? { collateralOutputHash: bbTx.collateralOutputHash } : {}),
+    ...(bbTx.collateralOutputIndex !== undefined ? { collateralOutputIndex: bbTx.collateralOutputIndex } : {}),
+    ...(bbTx.p2shAddress !== undefined ? { p2shAddress: bbTx.p2shAddress } : {}),
   };
 }
 
@@ -309,13 +342,13 @@ export function convertFluxIndexerAddress(bbAddr: FluxIndexerAddress): AddressIn
   return {
     addrStr: bbAddr.address,
     balance: satoshisToFlux(bbAddr.balance || '0'),
-    balanceSat: parseInt(bbAddr.balance || '0'),
+    balanceSat: bbAddr.balance || '0',
     totalReceived: satoshisToFlux(bbAddr.totalReceived || '0'),
-    totalReceivedSat: parseInt(bbAddr.totalReceived || '0'),
+    totalReceivedSat: bbAddr.totalReceived || '0',
     totalSent: satoshisToFlux(bbAddr.totalSent || '0'),
-    totalSentSat: parseInt(bbAddr.totalSent || '0'),
+    totalSentSat: bbAddr.totalSent || '0',
     unconfirmedBalance: satoshisToFlux(bbAddr.unconfirmedBalance || '0'),
-    unconfirmedBalanceSat: parseInt(bbAddr.unconfirmedBalance || '0'),
+    unconfirmedBalanceSat: bbAddr.unconfirmedBalance || '0',
     unconfirmedTxApperances: bbAddr.unconfirmedTxs || 0,
     txApperances: bbAddr.txs || 0,
     transactions: bbAddr.transactions?.map((tx: { txid: string }) => tx.txid) || [],

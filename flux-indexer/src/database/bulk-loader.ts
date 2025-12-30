@@ -659,6 +659,34 @@ export async function invalidateFromHeight(
   ch: ClickHouseConnection,
   fromHeight: number
 ): Promise<void> {
+  // Best-effort: ensure any buffered async inserts (especially UTXOs) are flushed
+  // before we snapshot affected keys and perform reorg invalidation.
+  try {
+    await ch.command('SYSTEM FLUSH ASYNC INSERT QUEUE');
+  } catch {
+    // Older ClickHouse versions may not support this; continue without failing reorg handling.
+  }
+
+  // Capture affected derived-table keys before invalidation (is_valid still 1 here)
+  const [affectedAddressRows, affectedBlockRange] = await Promise.all([
+    ch.query<{ address: string }>(`
+      SELECT address
+      FROM address_transactions FINAL
+      WHERE block_height >= ${fromHeight} AND is_valid = 1 AND address != '' AND address != 'UNKNOWN'
+      GROUP BY address
+    `),
+    ch.queryOne<{ min_ts: number; max_ts: number }>(`
+      SELECT
+        min(timestamp) as min_ts,
+        max(timestamp) as max_ts
+      FROM blocks FINAL
+      WHERE height >= ${fromHeight} AND is_valid = 1
+    `),
+  ]);
+
+  const affectedAddresses = affectedAddressRows.map(r => r.address);
+  const minAffectedTimestamp = affectedBlockRange?.min_ts;
+
   // Invalidate blocks
   await ch.command(`
     ALTER TABLE blocks UPDATE is_valid = 0
@@ -683,13 +711,19 @@ export async function invalidateFromHeight(
     WHERE block_height >= ${fromHeight} AND is_valid = 1
   `);
 
+  // Invalidate supply_stats (no is_valid column, so delete rows)
+  await ch.command(`
+    ALTER TABLE supply_stats DELETE
+    WHERE block_height >= ${fromHeight}
+  `);
+
   // For UTXOs, we need to handle both created and spent UTXOs
   // Mark UTXOs created in rolled-back blocks as having 0 value
   const version = getVersion();
 
   // Get UTXOs created in the reorged range
-  const createdUtxos = await ch.query<{ txid: string; vout: number }>(`
-    SELECT txid, vout FROM utxos FINAL
+  const createdUtxos = await ch.query<{ txid: string; vout: number; block_height: number; address: string }>(`
+    SELECT txid, vout, block_height, address FROM utxos FINAL
     WHERE block_height >= ${fromHeight}
   `);
 
@@ -698,16 +732,19 @@ export async function invalidateFromHeight(
     const invalidRows = createdUtxos.map((u) => ({
       txid: u.txid,
       vout: u.vout,
-      address: '',
+      address: u.address,
       value: '0',
       script_type: 'invalidated',
-      block_height: 0,
+      // IMPORTANT: keep the original block_height so the replacement lands in the same partition
+      // (ReplacingMergeTree merges/replaces within a partition)
+      block_height: u.block_height,
       spent: 1,
       spent_txid: padHash(null),
       spent_block_height: 0,
       version: version.toString(),
     }));
-    await ch.insert('utxos', invalidRows);
+    // Must be immediately visible before rebuilding derived tables
+    await ch.syncInsert('utxos', invalidRows);
   }
 
   // "Unspend" UTXOs that were spent in rolled-back blocks
@@ -737,9 +774,192 @@ export async function invalidateFromHeight(
       spent_block_height: 0,
       version: version.toString(),
     }));
-    await ch.insert('utxos', unspendRows);
+    // Must be immediately visible before rebuilding derived tables
+    await ch.syncInsert('utxos', unspendRows);
   }
 
   // Wait for mutations to complete
   await ch.waitForMutations();
+
+  // Repair derived tables that cannot be made reorg-safe via is_valid mutations
+  // (SummingMergeTree/Materialized views do not react to UPDATE/DELETE on source tables)
+  if (affectedAddresses.length > 0) {
+    await repairAddressSummaries(ch, affectedAddresses);
+  }
+
+  if (minAffectedTimestamp !== undefined && minAffectedTimestamp > 0) {
+    await repairAnalyticsAfterReorg(ch, minAffectedTimestamp);
+  }
+
+  await repairProducers(ch);
+}
+
+function escapeClickHouseString(value: string): string {
+  // Conservative escaping for single-quoted string literals
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+async function repairAddressSummaries(ch: ClickHouseConnection, addresses: string[]): Promise<void> {
+  // Keep statements reasonably sized (addresses are base58 and come from DB, not user input)
+  const addressChunks = chunk(addresses, 5000);
+
+  // Step 1: delete old summary rows for affected addresses
+  for (const batch of addressChunks) {
+    const inClause = batch.map(a => `'${escapeClickHouseString(a)}'`).join(', ');
+    await ch.command(`ALTER TABLE address_summary DELETE WHERE address IN (${inClause})`);
+    await ch.command(`ALTER TABLE address_summary_agg DELETE WHERE address IN (${inClause})`);
+  }
+  await ch.waitForMutations();
+
+  // Step 2: recompute and insert fresh summary rows
+  for (const batch of addressChunks) {
+    const inClause = batch.map(a => `'${escapeClickHouseString(a)}'`).join(', ');
+
+    const rows = await ch.query<{
+      address: string;
+      balance: string;
+      tx_count: number;
+      received_total: string;
+      sent_total: string;
+      unspent_count: number;
+      first_seen: number;
+      last_activity: number;
+    }>(`
+      SELECT
+        COALESCE(u.address, at.address) as address,
+        toString(toInt64(COALESCE(u.balance, 0))) as balance,
+        toUInt32(COALESCE(at.tx_count, 0)) as tx_count,
+        toString(toUInt64(COALESCE(at.received_total, 0))) as received_total,
+        toString(toUInt64(COALESCE(at.sent_total, 0))) as sent_total,
+        toUInt32(COALESCE(u.unspent_count, 0)) as unspent_count,
+        toUInt32(COALESCE(at.first_seen, u.first_block, 0)) as first_seen,
+        toUInt32(COALESCE(at.last_activity, u.last_block, 0)) as last_activity
+      FROM (
+        SELECT
+          address,
+          SUM(CASE WHEN spent = 0 THEN value ELSE 0 END) as balance,
+          SUM(CASE WHEN spent = 0 THEN 1 ELSE 0 END) as unspent_count,
+          MIN(block_height) as first_block,
+          MAX(CASE WHEN spent = 1 THEN spent_block_height ELSE block_height END) as last_block
+        FROM utxos FINAL
+        WHERE address IN (${inClause}) AND address != '' AND address != 'UNKNOWN' AND address != 'SHIELDED_OR_NONSTANDARD'
+        GROUP BY address
+      ) u
+      FULL OUTER JOIN (
+        SELECT
+          address,
+          uniqExact(txid) as tx_count,
+          SUM(received_value) as received_total,
+          SUM(sent_value) as sent_total,
+          MIN(block_height) as first_seen,
+          MAX(block_height) as last_activity
+        FROM address_transactions FINAL
+        WHERE address IN (${inClause}) AND is_valid = 1
+        GROUP BY address
+      ) at ON u.address = at.address
+      WHERE COALESCE(u.address, at.address) != ''
+    `);
+
+    if (rows.length > 0) {
+      await ch.insert('address_summary', rows.map((r) => ({
+        address: r.address,
+        balance: r.balance,
+        tx_count: r.tx_count,
+        received_total: r.received_total,
+        sent_total: r.sent_total,
+        unspent_count: r.unspent_count,
+        first_seen: r.first_seen,
+        last_activity: r.last_activity,
+      })));
+    }
+  }
+}
+
+async function repairProducers(ch: ClickHouseConnection): Promise<void> {
+  // Producers are fully derivable from the blocks table; rebuild is cheap (~2M rows max).
+  await ch.command('TRUNCATE TABLE producers');
+  await ch.command(`
+    INSERT INTO producers (fluxnode, blocks_produced, first_block, last_block, total_rewards, avg_block_time)
+    SELECT
+      producer as fluxnode,
+      toUInt32(count()) as blocks_produced,
+      toUInt32(min(height)) as first_block,
+      toUInt32(max(height)) as last_block,
+      toUInt64(sum(producer_reward)) as total_rewards,
+      0 as avg_block_time
+    FROM blocks FINAL
+    WHERE is_valid = 1 AND producer != ''
+    GROUP BY producer
+  `);
+}
+
+async function repairAnalyticsAfterReorg(ch: ClickHouseConnection, minTimestamp: number): Promise<void> {
+  // mv_daily_supply depends on supply_stats inserts; after reorg we delete supply_stats rows but must also
+  // rebuild affected mv ranges since materialized views do not react to source-table mutations.
+  await ch.command(`
+    ALTER TABLE mv_daily_supply DELETE
+    WHERE day >= toDate(toDateTime(${minTimestamp}))
+  `);
+
+  await ch.command(`
+    ALTER TABLE mv_hourly_tx_count DELETE
+    WHERE hour >= toStartOfHour(toDateTime(${minTimestamp}))
+  `);
+
+  await ch.waitForMutations();
+
+  // Rebuild daily supply rows from the remaining (valid) supply_stats.
+  const dailySupplyRows = await ch.query<{
+    day: string;
+    max_height: number;
+    transparent_supply: string;
+    shielded_pool: string;
+    total_supply: string;
+  }>(`
+    SELECT
+      toDate(toDateTime(timestamp)) AS day,
+      block_height as max_height,
+      toString(transparent_supply) as transparent_supply,
+      toString(shielded_pool) as shielded_pool,
+      toString(total_supply) as total_supply
+    FROM supply_stats FINAL
+    WHERE toDate(toDateTime(timestamp)) >= toDate(toDateTime(${minTimestamp}))
+  `);
+
+  if (dailySupplyRows.length > 0) {
+    await ch.insert('mv_daily_supply', dailySupplyRows.map((r) => ({
+      day: r.day,
+      max_height: r.max_height,
+      transparent_supply: r.transparent_supply,
+      shielded_pool: r.shielded_pool,
+      total_supply: r.total_supply,
+    })));
+  }
+
+  // Rebuild hourly tx counts from the remaining valid transactions.
+  // NOTE: block_count in mv_hourly_tx_count is not used for correctness; it is left as 0 here.
+  const hourlyTxRows = await ch.query<{ hour: string; tx_count: string }>(`
+    SELECT
+      toStartOfHour(toDateTime(timestamp)) AS hour,
+      toString(count()) as tx_count
+    FROM transactions FINAL
+    WHERE is_valid = 1 AND timestamp >= toUnixTimestamp(toStartOfHour(toDateTime(${minTimestamp})))
+    GROUP BY hour
+  `);
+
+  if (hourlyTxRows.length > 0) {
+    await ch.insert('mv_hourly_tx_count', hourlyTxRows.map((r) => ({
+      hour: r.hour,
+      tx_count: r.tx_count,
+      block_count: 0,
+    })));
+  }
 }

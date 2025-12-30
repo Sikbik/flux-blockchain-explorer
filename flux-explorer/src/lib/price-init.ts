@@ -15,6 +15,81 @@ import ky from 'ky';
 
 let initializationStarted = false;
 let hourlyUpdateInterval: NodeJS.Timeout | null = null;
+let hourlyLockHeld = false;
+
+const DATA_DIR = path.join(process.cwd(), 'data');
+const POPULATION_LOCK_PATH = path.join(DATA_DIR, 'price-population.lock');
+const HOURLY_LOCK_PATH = path.join(DATA_DIR, 'price-hourly.lock');
+const POPULATION_LOG_PATH = path.join(DATA_DIR, 'price-population.log');
+
+function envFlag(name: string, defaultValue: boolean): boolean {
+  const value = process.env[name];
+  if (value === undefined) return defaultValue;
+  return value === 'true' || value === '1';
+}
+
+function isPriceCacheEnabled(): boolean {
+  const autoInitEnv = process.env.AUTO_INIT_PRICES;
+  if (autoInitEnv === 'false' || process.env.DISABLE_PRICE_CACHE === 'true') {
+    return false;
+  }
+
+  const autoInitDefault = process.env.NODE_ENV === 'production';
+  const autoInit = autoInitEnv === 'true' ? true : autoInitDefault;
+  if (!autoInit) return false;
+
+  return envFlag('PRICE_CACHE_ENABLED', true);
+}
+
+function ensureDataDir(): void {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
+function tryAcquireLock(lockPath: string, staleAfterMs: number): boolean {
+  ensureDataDir();
+  try {
+    const fd = fs.openSync(lockPath, 'wx');
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+    fs.closeSync(fd);
+    return true;
+  } catch (error: unknown) {
+    const errnoCode = typeof error === 'object' && error !== null && 'code' in error
+      ? (error as { code?: unknown }).code
+      : undefined;
+    if (errnoCode !== 'EEXIST') return false;
+
+    try {
+      const stat = fs.statSync(lockPath);
+      if ((Date.now() - stat.mtimeMs) > staleAfterMs) {
+        fs.unlinkSync(lockPath);
+        return tryAcquireLock(lockPath, staleAfterMs);
+      }
+    } catch {
+      // Ignore and treat lock as held
+    }
+
+    return false;
+  }
+}
+
+function touchLock(lockPath: string): void {
+  try {
+    const now = new Date();
+    fs.utimesSync(lockPath, now, now);
+  } catch {
+    // Ignore
+  }
+}
+
+function releaseLock(lockPath: string): void {
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    // Ignore
+  }
+}
 
 /**
  * Check if price data needs initialization
@@ -57,11 +132,33 @@ export function initializePriceData(): void {
     return;
   }
 
+  if (!isPriceCacheEnabled() || !envFlag('PRICE_CACHE_POPULATE', true)) {
+    return;
+  }
+
   const status = checkPriceDataStatus();
 
   if (!status.needsInit) {
     console.log('✅ Price data is ready:', status.reason);
     return;
+  }
+
+  // Avoid spawning multiple population jobs across multi-instance deployments.
+  // The population script also enforces this lock and releases it when done.
+  const POPULATION_LOCK_STALE_AFTER_MS = 12 * 60 * 60 * 1000; // 12 hours
+  if (fs.existsSync(POPULATION_LOCK_PATH)) {
+    try {
+      const stat = fs.statSync(POPULATION_LOCK_PATH);
+      if ((Date.now() - stat.mtimeMs) <= POPULATION_LOCK_STALE_AFTER_MS) {
+        console.log('💰 Price data population already running (lock present)');
+        return;
+      }
+      fs.unlinkSync(POPULATION_LOCK_PATH);
+      console.warn('⚠️  Price population lock was stale and was cleared');
+    } catch {
+      console.log('💰 Price data population already running (lock present)');
+      return;
+    }
   }
 
   console.log('🚀 Initializing price data:', status.reason);
@@ -75,7 +172,8 @@ export function initializePriceData(): void {
   const scriptPath = path.join(process.cwd(), 'scripts', 'populate-price-history.ts');
 
   // Check if we have tsx available
-  const useTsx = fs.existsSync(path.join(process.cwd(), 'node_modules', '.bin', 'tsx'));
+  const tsxPath = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
+  const useTsx = fs.existsSync(tsxPath);
 
   if (!useTsx) {
     console.warn('⚠️  tsx not found - price data population requires: npm install tsx');
@@ -83,18 +181,23 @@ export function initializePriceData(): void {
     return;
   }
 
+  ensureDataDir();
+  const logFd = fs.openSync(POPULATION_LOG_PATH, 'a');
+
   // Spawn background process
-  const child = spawn('npx', ['tsx', scriptPath], {
+  const child = spawn(tsxPath, [scriptPath], {
     detached: true,
-    stdio: 'ignore', // Fully detached, won't block app
+    stdio: ['ignore', logFd, logFd],
     cwd: process.cwd(),
   });
+
+  fs.closeSync(logFd);
 
   // Detach from parent process
   child.unref();
 
   console.log(`📊 Price data population started (PID: ${child.pid})`);
-  console.log('   Check logs: tail -f data/price-population.log\n');
+  console.log('   Logs: tail -f data/price-population.log\n');
 }
 
 /**
@@ -143,6 +246,17 @@ export function startHourlyPriceUpdates(): void {
     return;
   }
 
+  if (!isPriceCacheEnabled() || !envFlag('PRICE_CACHE_HOURLY_UPDATES', true)) {
+    return;
+  }
+
+  // One instance should own hourly updates (shared volume deployments).
+  if (!tryAcquireLock(HOURLY_LOCK_PATH, 2 * 60 * 60 * 1000)) {
+    console.log('⏰ Skipping hourly price updates (lock held by another instance)');
+    return;
+  }
+  hourlyLockHeld = true;
+
   console.log('⏰ Starting hourly price updates (runs every 60 minutes)');
 
   // Run immediately on startup
@@ -150,6 +264,7 @@ export function startHourlyPriceUpdates(): void {
 
   // Then run every hour
   hourlyUpdateInterval = setInterval(() => {
+    touchLock(HOURLY_LOCK_PATH);
     updateLatestHourlyPrice();
   }, 60 * 60 * 1000); // 1 hour in milliseconds
 }
@@ -163,12 +278,17 @@ export function stopHourlyPriceUpdates(): void {
     hourlyUpdateInterval = null;
     console.log('⏰ Stopped hourly price updates');
   }
+
+  if (hourlyLockHeld) {
+    hourlyLockHeld = false;
+    releaseLock(HOURLY_LOCK_PATH);
+  }
 }
 
 /**
  * Auto-initialize on module load (only in production)
  */
-if (process.env.NODE_ENV === 'production' || process.env.AUTO_INIT_PRICES === 'true') {
+if (isPriceCacheEnabled()) {
   // Run initialization check after a short delay to not block server startup
   setTimeout(() => {
     try {
@@ -185,3 +305,7 @@ if (process.env.NODE_ENV === 'production' || process.env.AUTO_INIT_PRICES === 't
     }
   }, 5000); // 5 second delay after app starts
 }
+
+process.on('exit', () => {
+  stopHourlyPriceUpdates();
+});

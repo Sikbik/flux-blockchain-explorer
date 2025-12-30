@@ -23,7 +23,6 @@ import {
   convertFluxIndexerAddress,
   satoshisToFlux,
 } from "./fluxindexer-utils";
-import { parseFluxNodeTransaction, isFluxNodeTransaction, getTierFromCollateral } from "@/lib/flux-tx-parser";
 import { getApiConfig } from "./config";
 
 // FluxIndexer API response types
@@ -163,6 +162,15 @@ interface FluxIndexerTransactionResponse {
   hex?: string;
   receivedValue?: string;
   sentValue?: string;
+  // FluxNode transaction fields (provided by the indexer API when available)
+  nType?: number | null;
+  benchmarkTier?: string | null;
+  ip?: string | null;
+  fluxnodePubKey?: string | null;
+  sig?: string | null;
+  collateralOutputHash?: string | null;
+  collateralOutputIndex?: number | null;
+  p2shAddress?: string | null;
 }
 
 interface FluxIndexerAddressResponse {
@@ -204,6 +212,7 @@ interface FluxIndexerAddressTransactionsResponse {
   offset?: number;
   nextCursor?: {
     height: number;
+    txIndex: number;
     txid: string;
   };
 }
@@ -591,45 +600,7 @@ export class FluxIndexerAPI {
   static async getTransaction(txid: string): Promise<Transaction> {
     try {
       const response = await api().get(`api/v1/transactions/${txid}`).json<FluxIndexerTransactionResponse>();
-      const tx = convertFluxIndexerTransaction(response);
-
-      // Check if this is a FluxNode transaction (0 inputs, 0 outputs)
-      if (isFluxNodeTransaction(tx) && response.hex) {
-        // Parse FluxNode data from raw hex
-        const fluxNodeData = parseFluxNodeTransaction(response.hex);
-
-        if (fluxNodeData && fluxNodeData.collateralOutputHash) {
-          // Fetch the collateral transaction to determine tier
-          try {
-            const collateralTx = await api()
-              .get(`api/v1/transactions/${fluxNodeData.collateralOutputHash}`)
-              .json<FluxIndexerTransactionResponse>();
-
-            // Get the output at the specified index
-            const collateralOutput =
-              collateralTx.vout?.[fluxNodeData.collateralOutputIndex ?? 0];
-
-            if (collateralOutput?.value) {
-              // Convert satoshis to FLUX and determine tier
-              const collateralAmount = satoshisToFlux(
-                parseInt(collateralOutput.value)
-              );
-              fluxNodeData.benchmarkTier = getTierFromCollateral(collateralAmount);
-            }
-          } catch (collateralError) {
-            console.error("Failed to fetch collateral transaction:", collateralError);
-            // Continue with undefined tier if we can't fetch collateral
-          }
-
-          // Merge FluxNode-specific fields
-          return {
-            ...tx,
-            ...fluxNodeData,
-          };
-        }
-      }
-
-      return tx;
+      return convertFluxIndexerTransaction(response);
     } catch (error) {
       throw new FluxIndexerAPIError(
         `Failed to fetch transaction ${txid}`,
@@ -719,13 +690,7 @@ export class FluxIndexerAPI {
   static async getAddress(address: string): Promise<AddressInfo> {
     try {
       const response = await api()
-        .get(`api/v1/addresses/${address}`, {
-          searchParams: {
-            details: "txs",
-            page: 1,
-            pageSize: 1000,
-          },
-        })
+        .get(`api/v1/addresses/${address}`)
         .json<FluxIndexerAddressResponse>();
 
       const converted = convertFluxIndexerAddress(response);
@@ -843,6 +808,7 @@ export class FluxIndexerAPI {
       fromTimestamp?: number;
       toTimestamp?: number;
       cursorHeight?: number;
+      cursorTxIndex?: number;
       cursorTxid?: string;
     }
   ): Promise<AddressTransactionsPage> {
@@ -861,8 +827,9 @@ export class FluxIndexerAPI {
       };
 
       // Use cursor-based pagination if cursor is provided (works with timestamp filters too)
-      if (params?.cursorHeight !== undefined && params?.cursorTxid) {
+      if (params?.cursorHeight !== undefined && params?.cursorTxIndex !== undefined && params?.cursorTxid) {
         searchParams.cursorHeight = params.cursorHeight.toString();
+        searchParams.cursorTxIndex = params.cursorTxIndex.toString();
         searchParams.cursorTxid = params.cursorTxid;
         // Don't use offset when cursor is provided
       }

@@ -117,7 +117,7 @@ export function TransactionExportDialog({
       // ClickHouse handles cursor pagination well, 2000 is a good balance
       const batchSize = 2000;
       let allTransactions: AddressTransactionSummary[] = [];
-      let cursor: { height: number; txid: string } | undefined;
+      let cursor: { height: number; txIndex: number; txid: string } | undefined;
       let hasMore = true;
       let totalEstimate = 0;
 
@@ -130,6 +130,7 @@ export function TransactionExportDialog({
           fromTimestamp,
           toTimestamp,
           cursorHeight: cursor?.height,
+          cursorTxIndex: cursor?.txIndex,
           cursorTxid: cursor?.txid,
         });
 

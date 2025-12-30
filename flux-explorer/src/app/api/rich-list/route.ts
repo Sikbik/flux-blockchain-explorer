@@ -7,6 +7,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import ky from "ky";
 import type { RichListData, RichListAddress } from "@/types/rich-list";
+import { satoshisToFlux } from "@/lib/api/fluxindexer-utils";
 
 // Get indexer URL from environment
 // Production (Flux/VPS): SERVER_API_URL set via docker-compose
@@ -231,13 +232,13 @@ async function fetchRichListData(minBalance: number): Promise<RichListData> {
       metadata = response;
     }
 
-    const totalSupplyFlux = Number(response.totalSupply || "0") / 1e8;
+    const totalSupplyFlux = satoshisToFlux(response.totalSupply || "0");
 
     response.addresses.forEach((address) => {
       if (aggregatedAddresses.length >= MAX_ADDRESSES) {
         return;
       }
-      const balanceFlux = Number(address.balance || "0") / 1e8;
+      const balanceFlux = satoshisToFlux(address.balance || "0");
       const percentage =
         totalSupplyFlux > 0 ? (balanceFlux / totalSupplyFlux) * 100 : 0;
 
@@ -271,7 +272,7 @@ async function fetchRichListData(minBalance: number): Promise<RichListData> {
   // Note: Supply endpoint now returns FLUX values (not zatoshis), so no conversion needed
   const totalSupplyFlux = supplyStats
     ? Number(supplyStats.totalSupply || "0")
-    : Number(metadata.totalSupply || "0") / 1e8;
+    : satoshisToFlux(metadata.totalSupply || "0");
 
   const transparentSupplyFlux = supplyStats
     ? Number(supplyStats.transparentSupply || "0")

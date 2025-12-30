@@ -122,12 +122,34 @@ export function useTransactionsBatch(
   txids: string[],
   blockHeight?: number
 ): UseQueryResult<Transaction[], Error> {
-  // Create a stable key from txids (sort a COPY to avoid mutating the input array)
-  const txidsKey = [...txids].sort().join(',');
+  // Stable cache key should not depend on input order.
+  // Store results in a deterministic (sorted) order, then re-order per caller via `select`.
+  const txidsSorted = [...txids].sort();
+  const txidsKey = txidsSorted.join(",");
 
   return useQuery<Transaction[], Error>({
     queryKey: [...transactionKeys.all, "batch", txidsKey, blockHeight],
-    queryFn: () => FluxAPI.getTransactionsBatch(txids, blockHeight),
+    queryFn: () => FluxAPI.getTransactionsBatch(txidsSorted, blockHeight),
+    select: (transactions) => {
+      const txMap = new Map(transactions.map((tx) => [tx.txid.toLowerCase(), tx]));
+      return txids.map((txid) => txMap.get(txid.toLowerCase()) ?? {
+        txid,
+        version: 0,
+        locktime: 0,
+        vin: [],
+        vout: [],
+        blockhash: "",
+        blockheight: 0,
+        confirmations: 0,
+        time: 0,
+        blocktime: 0,
+        valueOut: 0,
+        valueIn: 0,
+        fees: 0,
+        size: 0,
+        vsize: 0,
+      });
+    },
     enabled: txids.length > 0 && txids.every(txid => txid.length === 64),
     staleTime: 5 * 60 * 1000, // 5 minutes - confirmed transactions don't change
   });

@@ -10,7 +10,7 @@ import { ClickHouseConnection, getClickHouse } from '../database/connection';
 import { ClickHouseBlockIndexer } from './block-indexer';
 import { ParallelBlockFetcher } from './parallel-fetcher';
 import { logger } from '../utils/logger';
-import { Block } from '../types';
+import { Block, SyncError } from '../types';
 import {
   updateSyncState,
   recordReorg,
@@ -63,6 +63,7 @@ export class ClickHouseSyncEngine {
   private ch: ClickHouseConnection;
   private isRunning = false;
   private syncInterval: NodeJS.Timeout | null = null;
+  private readonly startedAt = Date.now();
   private lastSyncTime = Date.now();
   private blocksIndexed = 0;
   private syncInProgress = false;
@@ -635,7 +636,8 @@ export class ClickHouseSyncEngine {
       isRunning: this.isRunning,
       blocksIndexed: this.blocksIndexed,
       lastSyncTime: new Date(this.lastSyncTime),
-      uptimeSeconds: (Date.now() - this.lastSyncTime) / 1000,
+      uptimeSeconds: (Date.now() - this.startedAt) / 1000,
+      secondsSinceLastSync: (Date.now() - this.lastSyncTime) / 1000,
     };
   }
 

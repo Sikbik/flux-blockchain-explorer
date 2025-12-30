@@ -208,13 +208,13 @@ export interface AddressTransaction {
 export interface AddressInfo {
   addrStr: string;
   balance: number;
-  balanceSat: number;
+  balanceSat: string;
   totalReceived: number;
-  totalReceivedSat: number;
+  totalReceivedSat: string;
   totalSent: number;
-  totalSentSat: number;
+  totalSentSat: string;
   unconfirmedBalance: number;
-  unconfirmedBalanceSat: number;
+  unconfirmedBalanceSat: string;
   unconfirmedTxApperances: number;
   txApperances: number;
   transactions: string[]; // Array of transaction IDs
@@ -308,6 +308,7 @@ export interface QueryParams {
   limit?: number;
   offset?: number;
   cursorHeight?: number;
+  cursorTxIndex?: number;
   cursorTxid?: string;
 }
 
@@ -347,6 +348,7 @@ export interface AddressTransactionsPage extends PaginatedResponse<AddressTransa
   offset: number;
   nextCursor?: {
     height: number;
+    txIndex: number;
     txid: string;
   };
 }

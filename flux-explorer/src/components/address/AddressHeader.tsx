@@ -16,7 +16,7 @@ interface AddressHeaderProps {
 export function AddressHeader({ addressInfo }: AddressHeaderProps) {
   const [showQR, setShowQR] = useState(false);
   const hasBalance = addressInfo.balance > 0;
-  const hasUnconfirmed = addressInfo.unconfirmedBalance > 0;
+  const hasUnconfirmed = addressInfo.unconfirmedTxApperances > 0;
 
   return (
     <>
