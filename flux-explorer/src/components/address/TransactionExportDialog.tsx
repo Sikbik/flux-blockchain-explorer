@@ -113,9 +113,10 @@ export function TransactionExportDialog({
       const fromTimestamp = Math.floor(dateRange.from.getTime() / 1000);
       const toTimestamp = Math.floor(dateRange.to.getTime() / 1000);
 
-      // Use moderate batch size with cursor-based pagination for efficiency
-      // ClickHouse handles cursor pagination well, 2000 is a good balance
-      const batchSize = 2000;
+      // Use moderate batch size with cursor-based pagination for efficiency.
+      // NOTE: Higher values can trigger ClickHouse HTTP param size limits when the backend
+      // fetches additional per-tx details (e.g., fees) for large batches.
+      const batchSize = 1000;
       let allTransactions: AddressTransactionSummary[] = [];
       let cursor: { height: number; txIndex: number; txid: string } | undefined;
       let hasMore = true;
