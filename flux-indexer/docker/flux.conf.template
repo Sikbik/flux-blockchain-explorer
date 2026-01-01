@@ -14,7 +14,8 @@ rpcallowip=::1
 addressindex=1
 timestampindex=1
 spentindex=1
-txindex=1
+# Optional: improves historical getrawtransaction lookups, but not required for indexing
+txindex=0
 
 # Performance
 dbcache=1024

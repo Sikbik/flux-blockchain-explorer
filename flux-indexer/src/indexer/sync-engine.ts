@@ -10,7 +10,7 @@ import { ClickHouseConnection, getClickHouse } from '../database/connection';
 import { ClickHouseBlockIndexer } from './block-indexer';
 import { ParallelBlockFetcher } from './parallel-fetcher';
 import { logger } from '../utils/logger';
-import { Block } from '../types';
+import { Block, SyncError } from '../types';
 import {
   updateSyncState,
   recordReorg,
@@ -63,6 +63,7 @@ export class ClickHouseSyncEngine {
   private ch: ClickHouseConnection;
   private isRunning = false;
   private syncInterval: NodeJS.Timeout | null = null;
+  private readonly startedAt = Date.now();
   private lastSyncTime = Date.now();
   private blocksIndexed = 0;
   private syncInProgress = false;
@@ -268,7 +269,7 @@ export class ClickHouseSyncEngine {
 
         for (let height = currentHeight + 1; height <= currentHeight + batchSize; height++) {
           try {
-            await this.blockIndexer.indexBlock(height);
+            await this.blockIndexer.indexBlock(height, chainHeight);
             lastHeight = height;
             processedThisBatch++;
             this.blocksIndexed++;
@@ -327,7 +328,7 @@ export class ClickHouseSyncEngine {
             // Process valid blocks in batch
             if (validBlocks.length > 0) {
               const batchStartHeight = lastHeight + 1;
-              const blocksProcessed = await this.blockIndexer.indexBlocksBatch(validBlocks, batchStartHeight);
+              const blocksProcessed = await this.blockIndexer.indexBlocksBatch(validBlocks, batchStartHeight, { chainHeight });
               lastHeight += blocksProcessed;
               processedThisBatch += blocksProcessed;
               this.blocksIndexed += blocksProcessed;
@@ -336,7 +337,7 @@ export class ClickHouseSyncEngine {
             // Handle any missing blocks individually
             for (const height of missingHeights) {
               logger.warn('Missing block from pipelined fetch, refetching', { height });
-              await this.blockIndexer.indexBlock(height);
+              await this.blockIndexer.indexBlock(height, chainHeight);
               lastHeight = height;
               processedThisBatch++;
               this.blocksIndexed++;
@@ -610,10 +611,20 @@ export class ClickHouseSyncEngine {
       WHERE height = {height:UInt32} AND is_valid = 1
     `, { height: commonAncestor });
 
+    let chainHeight = currentHeight;
+    try {
+      const chainInfo = await this.rpc.getBlockchainInfo();
+      chainHeight = chainInfo.headers;
+    } catch {
+      // Keep best-effort chainHeight for sync_state
+    }
+
+    const syncPercentage = chainHeight > 0 ? (commonAncestor / chainHeight) * 100 : 0;
+
     await updateSyncState(this.ch, {
       currentHeight: commonAncestor,
-      chainHeight: currentHeight,
-      syncPercentage: 0,
+      chainHeight,
+      syncPercentage,
       lastBlockHash: lastValidBlock?.hash || '',
       isSyncing: true,
       blocksPerSecond: 0,
@@ -635,7 +646,8 @@ export class ClickHouseSyncEngine {
       isRunning: this.isRunning,
       blocksIndexed: this.blocksIndexed,
       lastSyncTime: new Date(this.lastSyncTime),
-      uptimeSeconds: (Date.now() - this.lastSyncTime) / 1000,
+      uptimeSeconds: (Date.now() - this.startedAt) / 1000,
+      secondsSinceLastSync: (Date.now() - this.lastSyncTime) / 1000,
     };
   }
 

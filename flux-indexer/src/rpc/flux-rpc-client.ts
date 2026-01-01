@@ -251,7 +251,8 @@ export class FluxRPCClient {
    * Get raw transaction
    * @param txid - Transaction ID
    * @param verbose - If true, returns JSON; if false, returns hex
-   * Note: Flux daemon doesn't support blockhash parameter, requires txindex=1 for reliable lookups
+   * Note: For historical (mined) transactions, Flux daemon doesn't support the optional blockhash
+   * parameter, so txindex=1 is required for getrawtransaction to work outside the mempool.
    */
   async getRawTransaction(txid: string, verbose: boolean = true): Promise<Transaction | string> {
     // Convert boolean to integer for better daemon compatibility
@@ -468,21 +469,16 @@ export class FluxRPCClient {
 
   async batchGetRawTransactions(
     txids: string[],
-    verbose: boolean = true,
-    blockhash?: string | (string | undefined)[]
+    verbose: boolean = true
   ): Promise<Array<Transaction | string>> {
     if (txids.length === 0) {
       return [];
     }
 
-    const requests = txids.map((txid, index) => {
-      const params: any[] = [txid, verbose];
-      const hash = Array.isArray(blockhash) ? blockhash[index] : blockhash;
-      if (hash) {
-        params.push(hash);
-      }
-      return { method: 'getrawtransaction', params };
-    });
+    // Flux daemon expects verbosity as 0/1 (not boolean) and does not reliably support the
+    // optional blockhash parameter that some Bitcoin-derived daemons accept.
+    const verboseInt = verbose ? 1 : 0;
+    const requests = txids.map((txid) => ({ method: 'getrawtransaction', params: [txid, verboseInt] }));
     return this.batchCall<Transaction | string>(requests);
   }
 

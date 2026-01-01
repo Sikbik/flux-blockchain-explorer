@@ -7,7 +7,7 @@
 
 import { FluxRPCClient } from '../rpc/flux-rpc-client';
 import { ClickHouseConnection, getClickHouse } from '../database/connection';
-import { Block, Transaction, SyncError } from '../types';
+import { Block, RPCError, Transaction, SyncError } from '../types';
 import { logger } from '../utils/logger';
 import { isReconstructableScriptType } from '../utils/script-utils';
 import { determineFluxNodeTier, parseFluxNodeTransaction } from '../parsers/fluxnode-parser';
@@ -17,6 +17,7 @@ import {
   scanBlockTransactions,
   parseTransactionShieldedData,
 } from '../parsers/block-parser';
+import { decodeRawTransaction } from '../parsers/transaction-decoder';
 import {
   bulkInsertBlocks,
   bulkInsertTransactions,
@@ -116,7 +117,9 @@ export class ClickHouseBlockIndexer {
 
     // Get total balance from UTXOs (unspent)
     const utxoResult = await this.ch.queryOne<{ total: string }>(`
-      SELECT SUM(value) as total FROM utxos FINAL WHERE spent = 0
+      SELECT SUM(value) as total
+      FROM utxos FINAL
+      WHERE spent = 0 AND address != '' AND address != 'UNKNOWN' AND address != 'SHIELDED_OR_NONSTANDARD'
     `);
     const utxoTotal = BigInt(utxoResult?.total || '0');
 
@@ -339,10 +342,78 @@ export class ClickHouseBlockIndexer {
   /**
    * Index a single block
    */
-  async indexBlock(height: number): Promise<void> {
+  async indexBlock(height: number, chainHeight?: number): Promise<void> {
     try {
-      const block = await this.rpc.getBlock(height, 2);
-      await this.processBlock(block, height);
+      let block: Block;
+      try {
+        block = await this.rpc.getBlock(height, 2);
+      } catch (rpcError: any) {
+        if (!(rpcError instanceof RPCError) || !rpcError.message.includes('500')) {
+          throw rpcError;
+        }
+
+        logger.warn('getblock verbosity=2 failed, decoding txs from raw block hex', {
+          height,
+          error: rpcError.message,
+        });
+
+        const fallbackBlock = await this.rpc.getBlock(height, 1);
+        const rawHex = await this.rpc.getBlock(fallbackBlock.hash, 0) as unknown as string;
+
+        const decoded: Transaction[] = [];
+        try {
+          const scanned = scanBlockTransactions(rawHex, height);
+          for (const entry of scanned) {
+            if (entry.fluxNodeType !== undefined) {
+              const size = Math.floor(entry.hex.length / 2);
+              decoded.push({
+                txid: entry.txid,
+                hash: entry.txid,
+                version: entry.version,
+                size,
+                vsize: size,
+                locktime: 0,
+                vin: [],
+                vout: [],
+              });
+            } else {
+              decoded.push(decodeRawTransaction(entry.hex, { txid: entry.txid }));
+            }
+          }
+        } catch {
+          // Last resort: per-tx extraction by txid
+          const txids = Array.isArray(fallbackBlock.tx)
+            ? (fallbackBlock.tx as Array<string | Transaction>).filter((t): t is string => typeof t === 'string')
+            : [];
+
+          for (const txid of txids) {
+            const txHex = extractTransactionFromBlock(rawHex, txid, height);
+            if (!txHex) continue;
+
+            const fluxNodeData = parseFluxNodeTransaction(txHex);
+            if (fluxNodeData) {
+              const size = Math.floor(txHex.length / 2);
+              decoded.push({
+                txid,
+                hash: txid,
+                version: fluxNodeData.version,
+                size,
+                vsize: size,
+                locktime: 0,
+                vin: [],
+                vout: [],
+              });
+            } else {
+              decoded.push(decodeRawTransaction(txHex, { txid }));
+            }
+          }
+        }
+
+        fallbackBlock.tx = decoded;
+        block = fallbackBlock;
+      }
+
+      await this.processBlock(block, height, { chainHeight });
       logger.debug(`Indexed block ${height} (${block.hash})`);
     } catch (error: any) {
       logger.error(`Failed to index block ${height}`, { error: error.message });
@@ -371,7 +442,11 @@ export class ClickHouseBlockIndexer {
    *   - syncFluxnodeInsert: Use synchronous insert for fluxnode_transactions for immediate visibility
    *   - syncInsert: Use synchronous inserts for all tables (blocks, transactions, address_transactions)
    */
-  async indexBlocksBatch(blocks: Block[], startHeight: number, options?: { syncFluxnodeInsert?: boolean; syncInsert?: boolean }): Promise<number> {
+  async indexBlocksBatch(
+    blocks: Block[],
+    startHeight: number,
+    options?: { syncFluxnodeInsert?: boolean; syncInsert?: boolean; chainHeight?: number }
+  ): Promise<number> {
     if (blocks.length === 0) return 0;
 
     const startTime = Date.now();
@@ -462,8 +537,8 @@ export class ClickHouseBlockIndexer {
         continue;
       }
 
-      const transactions = block.tx as Transaction[];
-      if (!transactions || transactions.length === 0) {
+      const blockTx = block.tx;
+      if (!Array.isArray(blockTx) || blockTx.length === 0) {
         heightCheck++;
         continue;
       }
@@ -479,6 +554,10 @@ export class ClickHouseBlockIndexer {
           });
         }
 
+        const txidsFromRpc = (typeof blockTx[0] === 'string')
+          ? (blockTx as string[])
+          : (blockTx as Transaction[]).map(tx => tx.txid).filter(Boolean);
+
         // Verify we got all expected transactions
         const missingTxids: string[] = [];
         let fluxnodeInScanned = 0;
@@ -487,11 +566,8 @@ export class ClickHouseBlockIndexer {
             fluxnodeInScanned++;
           }
         }
-        for (const tx of transactions) {
-          if (!tx || !tx.txid) continue;
-          if (!scannedTxMap.has(tx.txid)) {
-            missingTxids.push(tx.txid);
-          }
+        for (const txid of txidsFromRpc) {
+          if (!scannedTxMap.has(txid)) missingTxids.push(txid);
         }
 
         if (missingTxids.length > 0) {
@@ -503,6 +579,31 @@ export class ClickHouseBlockIndexer {
           });
           throw new Error(`Scan missing ${missingTxids.length} transactions`);
         }
+
+        // If the daemon returned txids only (verbosity=1 fallback), decode txs from raw hex.
+        if (typeof blockTx[0] === 'string') {
+          const decoded: Transaction[] = [];
+          for (const scanned of scannedTxs) {
+            if (scanned.fluxNodeType !== undefined) {
+              const size = Math.floor(scanned.hex.length / 2);
+              decoded.push({
+                txid: scanned.txid,
+                hash: scanned.txid,
+                version: scanned.version,
+                size,
+                vsize: size,
+                locktime: 0,
+                vin: [],
+                vout: [],
+              });
+            } else {
+              decoded.push(decodeRawTransaction(scanned.hex, { txid: scanned.txid }));
+            }
+          }
+          block.tx = decoded;
+        }
+
+        const transactions = block.tx as Transaction[];
 
         // Process each transaction using the pre-built map
         for (const tx of transactions) {
@@ -542,40 +643,90 @@ export class ClickHouseBlockIndexer {
         }
       } catch (error) {
         // Fallback to per-tx extraction
-        for (const tx of transactions) {
-          if (!tx || !tx.txid) continue;
-          try {
-            const txHex = extractTransactionFromBlock(rawHex, tx.txid, heightCheck);
-            if (txHex) {
+        if (typeof blockTx[0] === 'string') {
+          const txids = blockTx as string[];
+          const decoded: Transaction[] = [];
+          block.tx = decoded;
+
+          for (const txid of txids) {
+            try {
+              const txHex = extractTransactionFromBlock(rawHex, txid, heightCheck);
+              if (!txHex) continue;
+
+              txHexMap!.set(txid, txHex);
+
+              const fluxNodeData = parseFluxNodeTransaction(txHex);
+              if (fluxNodeData) {
+                const size = Math.floor(txHex.length / 2);
+                decoded.push({
+                  txid,
+                  hash: txid,
+                  version: fluxNodeData.version,
+                  size,
+                  vsize: size,
+                  locktime: 0,
+                  vin: [],
+                  vout: [],
+                });
+                parsedFluxNodeData!.set(txid, {
+                  type: fluxNodeData.type,
+                  collateralHash: fluxNodeData.collateralHash,
+                  collateralIndex: fluxNodeData.collateralIndex,
+                  ip: fluxNodeData.ipAddress,
+                  publicKey: fluxNodeData.publicKey,
+                  signature: fluxNodeData.signature,
+                  tier: fluxNodeData.benchmarkTier,
+                  p2shAddress: fluxNodeData.p2shAddress,
+                });
+                continue;
+              }
+
+              const standardTx = decodeRawTransaction(txHex, { txid });
+              decoded.push(standardTx);
+
+              if (standardTx.version === 2 || standardTx.version === 4) {
+                const shieldedData = parseTransactionShieldedData(txHex);
+                if (shieldedData.vjoinsplit || shieldedData.valueBalance !== undefined) {
+                  parsedShieldedData!.set(txid, shieldedData);
+                }
+              }
+            } catch (err) {
+              logger.error('Exception extracting tx hex', { height: heightCheck, txid });
+            }
+          }
+        } else {
+          const transactions = blockTx as Transaction[];
+          for (const tx of transactions) {
+            if (!tx || !tx.txid) continue;
+            try {
+              const txHex = extractTransactionFromBlock(rawHex, tx.txid, heightCheck);
+              if (!txHex) continue;
+
               txHexMap!.set(tx.txid, txHex);
+
               if (tx.version === 2 || tx.version === 4) {
                 const shieldedData = parseTransactionShieldedData(txHex);
                 if (shieldedData.vjoinsplit || shieldedData.valueBalance !== undefined) {
                   parsedShieldedData!.set(tx.txid, shieldedData);
                 }
               }
-              if (tx.version === 3 || tx.version === 5 || tx.version === 6) {
-                const vin = tx.vin || [];
-                const vout = tx.vout || [];
-                if (vin.length === 0 && vout.length === 0) {
-                  const fluxNodeData = parseFluxNodeTransaction(txHex);
-                  if (fluxNodeData) {
-                    parsedFluxNodeData!.set(tx.txid, {
-                      type: fluxNodeData.type,
-                      collateralHash: fluxNodeData.collateralHash,
-                      collateralIndex: fluxNodeData.collateralIndex,
-                      ip: fluxNodeData.ipAddress,
-                      publicKey: fluxNodeData.publicKey,
-                      signature: fluxNodeData.signature,
-                      tier: fluxNodeData.benchmarkTier,
-                      p2shAddress: fluxNodeData.p2shAddress,
-                    });
-                  }
-                }
+
+              const fluxNodeData = parseFluxNodeTransaction(txHex);
+              if (fluxNodeData) {
+                parsedFluxNodeData!.set(tx.txid, {
+                  type: fluxNodeData.type,
+                  collateralHash: fluxNodeData.collateralHash,
+                  collateralIndex: fluxNodeData.collateralIndex,
+                  ip: fluxNodeData.ipAddress,
+                  publicKey: fluxNodeData.publicKey,
+                  signature: fluxNodeData.signature,
+                  tier: fluxNodeData.benchmarkTier,
+                  p2shAddress: fluxNodeData.p2shAddress,
+                });
               }
+            } catch (err) {
+              logger.error('Exception extracting tx hex', { height: heightCheck, txid: tx.txid });
             }
-          } catch (err) {
-            logger.error('Exception extracting tx hex', { height: heightCheck, txid: tx.txid });
           }
         }
       }
@@ -620,7 +771,12 @@ export class ClickHouseBlockIndexer {
     }> = [];
 
     // Supply tracking per block (includes timestamp for accurate date grouping in materialized views)
-    const supplyChanges: Array<{ height: number; timestamp: number; coinbaseReward: bigint; shieldedChange: bigint }> = [];
+    // Note: coinbase output total includes fees; we subtract per-block fees later so supply tracks only newly minted coins.
+    const supplyChanges: Array<{ height: number; timestamp: number; coinbaseOutputTotal: bigint; shieldedChange: bigint }> = [];
+    const blockFeesByHeight = new Map<number, bigint>();
+
+    // Producer stats (PoN) - collected during batch and updated once per batch
+    const producerBlocks = new Map<string, Array<{ height: number; reward: bigint }>>();
 
     // First pass: collect all data
     let currentHeight = startHeight;
@@ -636,6 +792,8 @@ export class ClickHouseBlockIndexer {
         continue;
       }
 
+      const producerRewardSat = block.producerReward ? BigInt(Math.round(block.producerReward * 1e8)) : null;
+
       blockRecords.push({
         height: currentHeight,
         hash: block.hash,
@@ -648,13 +806,23 @@ export class ClickHouseBlockIndexer {
         size: block.size ?? null,
         txCount: transactions.length,
         producer: block.producer || null,
-        producerReward: block.producerReward ? BigInt(Math.round(block.producerReward * 1e8)) : null,
+        producerReward: producerRewardSat,
         difficulty: block.difficulty ?? null,
         chainwork: block.chainwork || null,
       });
 
+      if (block.producer) {
+        const existing = producerBlocks.get(block.producer);
+        const reward = producerRewardSat ?? BigInt(0);
+        if (existing) {
+          existing.push({ height: currentHeight, reward });
+        } else {
+          producerBlocks.set(block.producer, [{ height: currentHeight, reward }]);
+        }
+      }
+
       // Track supply changes
-      let blockCoinbaseReward = BigInt(0);
+      let blockCoinbaseOutputTotal = BigInt(0);
       let blockShieldedChange = BigInt(0);
 
       let txIndexInBlock = 0;
@@ -666,7 +834,8 @@ export class ClickHouseBlockIndexer {
         const isCoinbase = vin.length > 0 && !!vin[0].coinbase;
 
         // Store tx metadata for address_transactions (denormalized)
-        txMetaMap.set(tx.txid, { blockHash: block.hash, txIndex: txIndexInBlock, isCoinbase });
+        const txIndex = txIndexInBlock;
+        txMetaMap.set(tx.txid, { blockHash: block.hash, txIndex, isCoinbase });
         txIndexInBlock++;
 
         // Collect outputs
@@ -789,7 +958,7 @@ export class ClickHouseBlockIndexer {
         txRecords.push({
           txid: tx.txid,
           blockHeight: currentHeight,
-          txIndex: txRecords.length,
+          txIndex,
           timestamp: block.time,
           version: tx.version,
           locktime: tx.locktime || 0,
@@ -827,7 +996,7 @@ export class ClickHouseBlockIndexer {
 
         // Track supply changes
         if (isCoinbase) {
-          blockCoinbaseReward = outputTotal;
+          blockCoinbaseOutputTotal = outputTotal;
         }
 
         // Extract shielded pool changes
@@ -860,7 +1029,7 @@ export class ClickHouseBlockIndexer {
       supplyChanges.push({
         height: currentHeight,
         timestamp: block.time,
-        coinbaseReward: blockCoinbaseReward,
+        coinbaseOutputTotal: blockCoinbaseOutputTotal,
         shieldedChange: blockShieldedChange,
       });
 
@@ -1056,6 +1225,7 @@ export class ClickHouseBlockIndexer {
         coinbaseTxRecord.fee = blockTotalFees;
       }
 
+      blockFeesByHeight.set(currentHeight, blockTotalFees);
       currentHeight++;
     }
 
@@ -1257,7 +1427,11 @@ export class ClickHouseBlockIndexer {
 
       const supplyStatsRecords: SupplyStatsInsert[] = [];
       for (const change of supplyChanges) {
-        transparentSupply += change.coinbaseReward - change.shieldedChange;
+        const blockFees = blockFeesByHeight.get(change.height) ?? BigInt(0);
+        const mintedReward = change.coinbaseOutputTotal - blockFees;
+        const mintedRewardSafe = mintedReward < BigInt(0) ? BigInt(0) : mintedReward;
+
+        transparentSupply += mintedRewardSafe - change.shieldedChange;
         shieldedPool += change.shieldedChange;
         const totalSupply = transparentSupply + shieldedPool;
         supplyStatsRecords.push({
@@ -1284,18 +1458,29 @@ export class ClickHouseBlockIndexer {
     totalTxProcessed += txRecords.length;
     totalUtxosCreated += utxoRecords.length;
 
-    // Update sync state to last block
-    const lastBlock = blocks[blocks.length - 1];
-    if (lastBlock) {
-      await updateSyncState(this.ch, {
-        currentHeight: startHeight + blocks.length - 1,
-        chainHeight: 0, // Updated separately
-        syncPercentage: 0,
-        lastBlockHash: lastBlock.hash,
-        isSyncing: true,
-        blocksPerSecond: blocks.length / ((Date.now() - startTime) / 1000),
-      });
-    }
+    await this.updateProducerStatsBatch(producerBlocks);
+
+	    // Update sync state to last block
+	    const lastBlock = blocks[blocks.length - 1];
+	    if (lastBlock) {
+	      const currentHeight = startHeight + blocks.length - 1;
+
+	      let chainHeight = options?.chainHeight;
+	      if (chainHeight === undefined || chainHeight <= 0) {
+	        const state = await this.getSyncState();
+	        chainHeight = state.chainHeight;
+	      }
+
+	      const syncPercentage = chainHeight > 0 ? (currentHeight / chainHeight) * 100 : 0;
+	      await updateSyncState(this.ch, {
+	        currentHeight,
+	        chainHeight,
+	        syncPercentage,
+	        lastBlockHash: lastBlock.hash,
+	        isSyncing: true,
+	        blocksPerSecond: blocks.length / ((Date.now() - startTime) / 1000),
+	      });
+	    }
 
     const elapsed = Date.now() - startTime;
     logger.debug(`Batch indexed ${blocks.length} blocks in ${elapsed}ms (${(blocks.length / (elapsed / 1000)).toFixed(1)} blocks/sec)`);
@@ -1319,7 +1504,11 @@ export class ClickHouseBlockIndexer {
   /**
    * Process a single block
    */
-  private async processBlock(block: Block, expectedHeight?: number, options?: { syncFluxnodeInsert?: boolean; syncInsert?: boolean }): Promise<void> {
+  private async processBlock(
+    block: Block,
+    expectedHeight?: number,
+    options?: { syncFluxnodeInsert?: boolean; syncInsert?: boolean; chainHeight?: number }
+  ): Promise<void> {
     const blockHeight = block.height ?? expectedHeight;
     if (blockHeight === undefined) {
       throw new SyncError('Block height is undefined', { blockHash: block.hash });
@@ -1327,20 +1516,17 @@ export class ClickHouseBlockIndexer {
 
     block.height = blockHeight;
     // Ensure block transactions are normalized (fetches any missing tx data)
-    await this.normalizeBlockTransactions(block);
+    block.tx = await this.normalizeBlockTransactions(block);
 
     // Process as a single-block batch
     // Use sync inserts when processing single blocks (tip-following mode) for immediate visibility
     await this.indexBlocksBatch([block], blockHeight, {
       syncFluxnodeInsert: options?.syncFluxnodeInsert ?? true,
-      syncInsert: options?.syncInsert ?? true
+      syncInsert: options?.syncInsert ?? true,
+      chainHeight: options?.chainHeight,
     });
 
     // Update producer stats if applicable
-    if (block.producer) {
-      await this.updateProducerStats(block);
-    }
-
     logDetailedMem(`block-${blockHeight}-cleared`, {
       cacheSize: this.rawTransactionCache.size,
       cacheQueueSize: this.rawTransactionCacheQueue.length,
@@ -1373,21 +1559,63 @@ export class ClickHouseBlockIndexer {
     });
 
     if (missing.length > 0) {
-      const uniqueTxids = Array.from(new Set(missing.map(item => item.txid)));
-      const fetched = await this.rpc.batchGetRawTransactions(uniqueTxids, true, block.hash);
+      // Decode missing txs from the raw block bytes instead of getrawtransaction (works with txindex=0).
+      const rawBlockHex = await this.rpc.getBlock(block.hash, 0) as unknown as string;
 
-      uniqueTxids.forEach((_txid, idx) => {
-        const fetchedTx = fetched[idx];
-        if (typeof fetchedTx !== 'string') {
-          this.cacheRawTransaction(fetchedTx);
+      let scannedTxMap: Map<string, { hex: string; version: number; fluxNodeType?: number }> | null = null;
+      try {
+        const scannedTxs = scanBlockTransactions(rawBlockHex, block.height);
+        scannedTxMap = new Map();
+        for (const scanned of scannedTxs) {
+          scannedTxMap.set(scanned.txid, {
+            hex: scanned.hex,
+            version: scanned.version,
+            fluxNodeType: scanned.fluxNodeType,
+          });
         }
-      });
+      } catch {
+        scannedTxMap = null;
+      }
 
       for (const { txid, index } of missing) {
-        const raw = this.rawTransactionCache.get(txid);
-        if (raw) {
-          normalized[index] = raw;
+        const scanned = scannedTxMap?.get(txid);
+        const txHex = scanned?.hex || extractTransactionFromBlock(rawBlockHex, txid, block.height);
+        if (!txHex) continue;
+
+        let decoded: Transaction;
+        if (scanned?.fluxNodeType !== undefined) {
+          const size = Math.floor(txHex.length / 2);
+          decoded = {
+            txid,
+            hash: txid,
+            version: scanned.version,
+            size,
+            vsize: size,
+            locktime: 0,
+            vin: [],
+            vout: [],
+          };
+        } else {
+          const fluxNodeData = parseFluxNodeTransaction(txHex);
+          if (fluxNodeData) {
+            const size = Math.floor(txHex.length / 2);
+            decoded = {
+              txid,
+              hash: txid,
+              version: fluxNodeData.version,
+              size,
+              vsize: size,
+              locktime: 0,
+              vin: [],
+              vout: [],
+            };
+          } else {
+            decoded = decodeRawTransaction(txHex, { txid });
+          }
         }
+
+        this.cacheRawTransaction(decoded);
+        normalized[index] = decoded;
       }
     }
 
@@ -1433,34 +1661,87 @@ export class ClickHouseBlockIndexer {
   }
 
   /**
-   * Update FluxNode producer statistics
+   * Update FluxNode producer statistics for a batch (PoN).
+   * Uses `last_block` as a guard to make retries idempotent.
    */
-  private async updateProducerStats(block: Block): Promise<void> {
-    if (!block.producer || block.height === undefined) return;
+  private async updateProducerStatsBatch(
+    producerBlocks: Map<string, Array<{ height: number; reward: bigint }>>
+  ): Promise<void> {
+    if (producerBlocks.size === 0) return;
 
-    const reward = block.producerReward ? BigInt(Math.floor(block.producerReward * 1e8)) : BigInt(0);
+    const fluxnodes = Array.from(producerBlocks.keys()).filter(Boolean);
+    if (fluxnodes.length === 0) return;
 
-    // Get existing producer stats
-    const existing = await this.ch.queryOne<{
+    const existingRows = await this.ch.query<{
+      fluxnode: string;
       blocks_produced: number;
       first_block: number;
-      total_rewards: string;
+      last_block: number;
+      total_rewards: string | number;
+      avg_block_time: number;
     }>(`
-      SELECT blocks_produced, first_block, total_rewards
-      FROM producers FINAL
-      WHERE fluxnode = {fluxnode:String}
-    `, { fluxnode: block.producer });
+      SELECT fluxnode, blocks_produced, first_block, last_block, total_rewards, avg_block_time
+      FROM (
+        SELECT fluxnode, blocks_produced, first_block, last_block, total_rewards, avg_block_time
+        FROM producers
+        WHERE fluxnode IN {fluxnodes:Array(String)}
+        ORDER BY fluxnode, updated_at DESC
+        LIMIT 1 BY fluxnode
+      )
+    `, { fluxnodes });
 
-    const update: ProducerUpdate = {
-      fluxnode: block.producer,
-      blocksProduced: (existing?.blocks_produced || 0) + 1,
-      firstBlock: existing?.first_block || block.height,
-      lastBlock: block.height,
-      totalRewards: BigInt(existing?.total_rewards || 0) + reward,
-      avgBlockTime: 0,
-    };
+    const existingByFluxnode = new Map<string, {
+      blocksProduced: number;
+      firstBlock: number;
+      lastBlock: number;
+      totalRewards: bigint;
+      avgBlockTime: number;
+    }>();
 
-    await bulkUpdateProducers(this.ch, [update]);
+    for (const row of existingRows) {
+      existingByFluxnode.set(row.fluxnode, {
+        blocksProduced: Number(row.blocks_produced),
+        firstBlock: Number(row.first_block),
+        lastBlock: Number(row.last_block),
+        totalRewards: BigInt(row.total_rewards.toString()),
+        avgBlockTime: Number(row.avg_block_time),
+      });
+    }
+
+    const updates: ProducerUpdate[] = [];
+
+    for (const fluxnode of fluxnodes) {
+      const blocks = producerBlocks.get(fluxnode);
+      if (!blocks || blocks.length === 0) continue;
+
+      const existing = existingByFluxnode.get(fluxnode);
+      const existingLastBlock = existing?.lastBlock ?? -1;
+      const newBlocks = blocks.filter(b => b.height > existingLastBlock);
+      if (newBlocks.length === 0) continue;
+
+      let deltaRewards = BigInt(0);
+      let minHeight = newBlocks[0].height;
+      let maxHeight = newBlocks[0].height;
+
+      for (const produced of newBlocks) {
+        deltaRewards += produced.reward;
+        minHeight = Math.min(minHeight, produced.height);
+        maxHeight = Math.max(maxHeight, produced.height);
+      }
+
+      updates.push({
+        fluxnode,
+        blocksProduced: (existing?.blocksProduced ?? 0) + newBlocks.length,
+        firstBlock: existing ? Math.min(existing.firstBlock, minHeight) : minHeight,
+        lastBlock: Math.max(existingLastBlock, maxHeight),
+        totalRewards: (existing?.totalRewards ?? BigInt(0)) + deltaRewards,
+        avgBlockTime: existing?.avgBlockTime ?? 0,
+      });
+    }
+
+    if (updates.length > 0) {
+      await bulkUpdateProducers(this.ch, updates);
+    }
   }
 
   /**

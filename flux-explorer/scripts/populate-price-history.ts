@@ -9,6 +9,8 @@
 
 import { batchSetPrices, getPriceDataRange, initPriceCache, getCacheStats } from '../src/lib/db/price-cache';
 import ky from 'ky';
+import fs from 'fs';
+import path from 'path';
 
 const apiClient = ky.create({
   prefixUrl: 'https://min-api.cryptocompare.com/data/v2',
@@ -32,6 +34,54 @@ interface CryptoCompareHistoHourResponse {
       close: number;
     }>;
   };
+}
+
+const DATA_DIR = path.join(process.cwd(), 'data');
+const LOCK_PATH = path.join(DATA_DIR, 'price-population.lock');
+const LOCK_STALE_AFTER_MS = 12 * 60 * 60 * 1000; // 12 hours
+
+function ensureDataDir(): void {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
+function acquireLock(command: string | undefined): boolean {
+  ensureDataDir();
+
+  try {
+    const fd = fs.openSync(LOCK_PATH, 'wx');
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: Date.now(), command: command ?? 'full' }));
+    fs.closeSync(fd);
+    return true;
+  } catch (error: any) {
+    if (error?.code !== 'EEXIST') {
+      console.error('❌ Failed to acquire price population lock:', error);
+      return false;
+    }
+
+    try {
+      const stat = fs.statSync(LOCK_PATH);
+      if ((Date.now() - stat.mtimeMs) > LOCK_STALE_AFTER_MS) {
+        fs.unlinkSync(LOCK_PATH);
+        console.warn('⚠️  Existing price population lock was stale and was cleared');
+        return acquireLock(command);
+      }
+    } catch {
+      // Ignore
+    }
+
+    console.log('⏭️  Price population already running (lock present), exiting');
+    return false;
+  }
+}
+
+function releaseLock(): void {
+  try {
+    fs.unlinkSync(LOCK_PATH);
+  } catch {
+    // Ignore
+  }
 }
 
 /**
@@ -217,6 +267,22 @@ async function dailyUpdate() {
 
 // Main execution
 const command = process.argv[2];
+
+if (!acquireLock(command)) {
+  process.exit(0);
+}
+
+process.on('exit', () => {
+  releaseLock();
+});
+process.on('SIGINT', () => {
+  releaseLock();
+  process.exit(0);
+});
+process.on('SIGTERM', () => {
+  releaseLock();
+  process.exit(0);
+});
 
 if (command === 'daily') {
   dailyUpdate().catch(error => {

@@ -50,7 +50,7 @@ export function AddressTransactions({
   const [showExportDialog, setShowExportDialog] = useState(false);
 
   // Cursor-based pagination state: track cursor for each page
-  const [cursorStack, setCursorStack] = useState<Array<{ height: number; txid: string } | null>>([null]);
+  const [cursorStack, setCursorStack] = useState<Array<{ height: number; txIndex: number; txid: string } | null>>([null]);
 
   // Get cursor for current page
   const currentCursor = cursorStack[currentPage - 1] || null;
@@ -69,7 +69,9 @@ export function AddressTransactions({
 
   const { data: txPage, isLoading, refetch } = useAddressTransactions(
     [addressInfo.addrStr],
-    currentCursor ? { cursorHeight: currentCursor.height, cursorTxid: currentCursor.txid, to: ITEMS_PER_PAGE } : { from, to },
+    currentCursor
+      ? { cursorHeight: currentCursor.height, cursorTxIndex: currentCursor.txIndex, cursorTxid: currentCursor.txid, to: ITEMS_PER_PAGE }
+      : { from, to },
     {
       staleTime: 0,
       placeholderData: keepPreviousData,

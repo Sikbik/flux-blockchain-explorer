@@ -207,7 +207,9 @@ rpcallowip=172.0.0.0/8
 addressindex=1
 timestampindex=1
 spentindex=1
-txindex=1
+
+# Optional: improves historical `getrawtransaction` lookups, but the indexer sync works with `txindex=0`
+txindex=0
 ```
 
 **Important:** Restart Flux daemon after changing config:

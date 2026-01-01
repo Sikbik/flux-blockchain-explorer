@@ -11,6 +11,7 @@ import path from 'path';
 import { ClickHouseConnection } from '../database/connection';
 import { FluxRPCClient } from '../rpc/flux-rpc-client';
 import { ClickHouseSyncEngine } from '../indexer/sync-engine';
+import type { Transaction } from '../types';
 import { logger } from '../utils/logger';
 import { extractTransactionFromBlock } from '../parsers/block-parser';
 
@@ -18,12 +19,20 @@ export class ClickHouseAPIServer {
   private app: express.Application;
   private server: any;
   private daemonReady = false;
+  private static readonly TXID_REGEX = /^[0-9a-fA-F]{1,64}$/;
+  private static readonly SATOSHIS_PER_FLUX = 100000000n;
 
   // Caches
   private statsCache: { data: any | null; timestamp: number } = { data: null, timestamp: 0 };
   private statusCache: { data: any | null; timestamp: number } = { data: null, timestamp: 0 };
   private static readonly STATUS_CACHE_TTL = 30000; // 30s for status (doesn't need to be instant)
   private static readonly STATS_CACHE_TTL = 2000;   // 2s for dashboard stats (matches frontend polling)
+  private mempoolAddressCache: { data: Map<string, { balanceDelta: bigint; txCount: number }>; timestamp: number } = {
+    data: new Map(),
+    timestamp: 0,
+  };
+  private mempoolAddressCacheInFlight: Promise<Map<string, { balanceDelta: bigint; txCount: number }>> | null = null;
+  private static readonly MEMPOOL_ADDRESS_CACHE_TTL = 5000; // 5s (fast enough for UX, low enough RPC load)
 
   constructor(
     private ch: ClickHouseConnection,
@@ -35,6 +44,266 @@ export class ClickHouseAPIServer {
     this.setupMiddleware();
     this.setupRoutes();
     this.setupErrorHandling();
+  }
+
+  private static zatoshisToFluxString(zatoshis: bigint): string {
+    const isNegative = zatoshis < 0n;
+    const absValue = isNegative ? -zatoshis : zatoshis;
+
+    const whole = absValue / ClickHouseAPIServer.SATOSHIS_PER_FLUX;
+    const fractional = absValue % ClickHouseAPIServer.SATOSHIS_PER_FLUX;
+
+    if (fractional === 0n) {
+      return `${isNegative ? '-' : ''}${whole.toString()}`;
+    }
+
+    const fractionalStr = fractional.toString().padStart(8, '0').replace(/0+$/, '');
+    return `${isNegative ? '-' : ''}${whole.toString()}.${fractionalStr}`;
+  }
+
+  private static zatoshisToFluxNumber(zatoshis: bigint): number {
+    const isNegative = zatoshis < 0n;
+    const absValue = isNegative ? -zatoshis : zatoshis;
+
+    const whole = absValue / ClickHouseAPIServer.SATOSHIS_PER_FLUX;
+    const fractional = absValue % ClickHouseAPIServer.SATOSHIS_PER_FLUX;
+
+    const value = Number(whole) + (Number(fractional) / 1e8);
+    return isNegative ? -value : value;
+  }
+
+  private static padFixedString64(value: string): string {
+    return value.trim().padStart(64, '0').slice(0, 64);
+  }
+
+  private static coerceStringParam(raw: unknown): string | undefined {
+    if (raw === undefined || raw === null) return undefined;
+    if (Array.isArray(raw)) {
+      if (raw.length === 0) return undefined;
+      const first = raw[0];
+      if (first === undefined || first === null) return undefined;
+      return typeof first === 'string' ? first : String(first);
+    }
+    return typeof raw === 'string' ? raw : String(raw);
+  }
+
+  private static parseBoundedInt(
+    raw: unknown,
+    options: {
+      name: string;
+      defaultValue?: number;
+      min?: number;
+      max?: number;
+      required?: boolean;
+      clamp?: boolean;
+    }
+  ): { value?: number; error?: string } {
+    const rawStr = ClickHouseAPIServer.coerceStringParam(raw);
+    const trimmed = rawStr?.trim();
+    const isMissing = trimmed === undefined || trimmed === '';
+
+    if (isMissing) {
+      if (options.required) {
+        return { error: `${options.name} parameter is required` };
+      }
+      return { value: options.defaultValue };
+    }
+
+    if (!/^-?\d+$/.test(trimmed)) {
+      return { error: `Invalid ${options.name} (must be an integer)` };
+    }
+
+    const parsed = Number(trimmed);
+    if (!Number.isSafeInteger(parsed)) {
+      return { error: `Invalid ${options.name} (must be a safe integer)` };
+    }
+
+    if (options.min !== undefined && parsed < options.min) {
+      return { error: `Invalid ${options.name} (must be >= ${options.min})` };
+    }
+
+    if (options.max !== undefined && parsed > options.max) {
+      if (options.clamp === false) {
+        return { error: `Invalid ${options.name} (must be <= ${options.max})` };
+      }
+      return { value: options.max };
+    }
+
+    return { value: parsed };
+  }
+
+  private isAddressableUtxoAddress(address: string | null | undefined): address is string {
+    return !!address && address !== 'UNKNOWN' && address !== 'SHIELDED_OR_NONSTANDARD';
+  }
+
+  private async getMempoolAddressDeltas(): Promise<Map<string, { balanceDelta: bigint; txCount: number }>> {
+    const now = Date.now();
+    if ((now - this.mempoolAddressCache.timestamp) < ClickHouseAPIServer.MEMPOOL_ADDRESS_CACHE_TTL) {
+      return this.mempoolAddressCache.data;
+    }
+
+    if (this.mempoolAddressCacheInFlight) {
+      return this.mempoolAddressCacheInFlight;
+    }
+
+    this.mempoolAddressCacheInFlight = (async () => {
+      try {
+        const data = await this.computeMempoolAddressDeltas();
+        this.mempoolAddressCache = { data, timestamp: Date.now() };
+        return data;
+      } catch (error: any) {
+        logger.debug('Failed to compute mempool address deltas', { error: error?.message || error });
+        // Avoid hammering the daemon if it's unavailable.
+        this.mempoolAddressCache = { data: new Map(), timestamp: Date.now() };
+        return this.mempoolAddressCache.data;
+      } finally {
+        this.mempoolAddressCacheInFlight = null;
+      }
+    })();
+
+    return this.mempoolAddressCacheInFlight;
+  }
+
+  private async computeMempoolAddressDeltas(): Promise<Map<string, { balanceDelta: bigint; txCount: number }>> {
+    const mempoolTxidsResult = await this.rpc.getRawMempool(false);
+    const mempoolTxids = Array.isArray(mempoolTxidsResult)
+      ? mempoolTxidsResult
+      : Object.keys(mempoolTxidsResult || {});
+
+    if (mempoolTxids.length === 0) {
+      return new Map();
+    }
+
+    const MAX_MEMPOOL_TXS = 5000;
+    const txids = mempoolTxids.length > MAX_MEMPOOL_TXS ? mempoolTxids.slice(0, MAX_MEMPOOL_TXS) : mempoolTxids;
+    if (mempoolTxids.length > MAX_MEMPOOL_TXS) {
+      logger.warn('Mempool too large for full address delta scan, truncating', {
+        mempoolSize: mempoolTxids.length,
+        max: MAX_MEMPOOL_TXS,
+      });
+    }
+
+    const mempoolTxs: Transaction[] = [];
+    const BATCH_SIZE = 50;
+
+    for (let i = 0; i < txids.length; i += BATCH_SIZE) {
+      const batch = txids.slice(i, i + BATCH_SIZE);
+      try {
+        const results = await this.rpc.batchGetRawTransactions(batch, true);
+        for (const result of results) {
+          if (typeof result !== 'string') {
+            mempoolTxs.push(result);
+          }
+        }
+      } catch {
+        // Best-effort fallback: tolerate txs disappearing from the mempool between calls.
+        for (const txid of batch) {
+          try {
+            const result = await this.rpc.getRawTransaction(txid, true);
+            if (typeof result !== 'string') {
+              mempoolTxs.push(result);
+            }
+          } catch {
+            // ignore missing/evicted mempool txs
+          }
+        }
+      }
+    }
+
+    if (mempoolTxs.length === 0) {
+      return new Map();
+    }
+
+    // Build map of outputs created in the mempool (for same-mempool spends).
+    const mempoolOutpointMap = new Map<string, { address: string; value: bigint }>();
+    for (const tx of mempoolTxs) {
+      const txid = ClickHouseAPIServer.padFixedString64(tx.txid);
+      for (const output of tx.vout || []) {
+        const address = output.scriptPubKey?.addresses?.[0];
+        if (!this.isAddressableUtxoAddress(address)) continue;
+        const valueSat = BigInt(Math.round(output.value * 100000000));
+        mempoolOutpointMap.set(`${txid}:${output.n}`, { address, value: valueSat });
+      }
+    }
+
+    // Collect input outpoints that must be resolved from ClickHouse.
+    const outpointsToResolve = new Map<string, { txid: string; vout: number }>();
+    for (const tx of mempoolTxs) {
+      for (const input of tx.vin || []) {
+        if (input.coinbase || !input.txid || input.vout === undefined) continue;
+        const prevTxid = ClickHouseAPIServer.padFixedString64(input.txid);
+        const key = `${prevTxid}:${input.vout}`;
+        if (mempoolOutpointMap.has(key)) continue;
+        outpointsToResolve.set(key, { txid: prevTxid, vout: input.vout });
+      }
+    }
+
+    const chOutpointMap = new Map<string, { address: string; value: bigint }>();
+    if (outpointsToResolve.size > 0) {
+      const outpoints = Array.from(outpointsToResolve.values()).map((o) => [o.txid, o.vout]);
+      const rows = await this.ch.query<{
+        txid: string;
+        vout: number;
+        address: string;
+        value: string;
+      }>(`
+        SELECT txid, vout, address, toString(value) as value
+        FROM (
+          SELECT txid, vout, address, value, spent
+          FROM utxos
+          WHERE (txid, vout) IN {outpoints:Array(Tuple(FixedString(64), UInt16))}
+          ORDER BY txid, vout, version DESC
+          LIMIT 1 BY txid, vout
+        )
+        WHERE spent = 0
+      `, { outpoints });
+
+      for (const row of rows) {
+        if (!this.isAddressableUtxoAddress(row.address)) continue;
+        chOutpointMap.set(`${row.txid}:${row.vout}`, { address: row.address, value: BigInt(row.value) });
+      }
+    }
+
+    // Aggregate per-address deltas and tx counts.
+    const balanceDeltaByAddress = new Map<string, bigint>();
+    const txCountByAddress = new Map<string, number>();
+
+    for (const tx of mempoolTxs) {
+      const touchedAddresses = new Set<string>();
+
+      for (const output of tx.vout || []) {
+        const address = output.scriptPubKey?.addresses?.[0];
+        if (!this.isAddressableUtxoAddress(address)) continue;
+        const valueSat = BigInt(Math.round(output.value * 100000000));
+        balanceDeltaByAddress.set(address, (balanceDeltaByAddress.get(address) ?? BigInt(0)) + valueSat);
+        touchedAddresses.add(address);
+      }
+
+      for (const input of tx.vin || []) {
+        if (input.coinbase || !input.txid || input.vout === undefined) continue;
+        const prevTxid = ClickHouseAPIServer.padFixedString64(input.txid);
+        const key = `${prevTxid}:${input.vout}`;
+        const prevOut = mempoolOutpointMap.get(key) ?? chOutpointMap.get(key);
+        if (!prevOut) continue;
+        if (!this.isAddressableUtxoAddress(prevOut.address)) continue;
+        balanceDeltaByAddress.set(
+          prevOut.address,
+          (balanceDeltaByAddress.get(prevOut.address) ?? BigInt(0)) - prevOut.value
+        );
+        touchedAddresses.add(prevOut.address);
+      }
+
+      for (const addr of touchedAddresses) {
+        txCountByAddress.set(addr, (txCountByAddress.get(addr) ?? 0) + 1);
+      }
+    }
+
+    const result = new Map<string, { balanceDelta: bigint; txCount: number }>();
+    for (const [address, txCount] of txCountByAddress) {
+      result.set(address, { balanceDelta: balanceDeltaByAddress.get(address) ?? BigInt(0), txCount });
+    }
+
+    return result;
   }
 
   private setupMiddleware(): void {
@@ -142,7 +411,15 @@ export class ClickHouseAPIServer {
         chain_height: number;
         is_syncing: number;
         sync_percentage: number;
-      }>('SELECT current_height, chain_height, is_syncing, sync_percentage FROM sync_state FINAL WHERE id = 1');
+      }>(`
+        SELECT
+          argMax(current_height, updated_at) as current_height,
+          argMax(chain_height, updated_at) as chain_height,
+          argMax(is_syncing, updated_at) as is_syncing,
+          argMax(sync_percentage, updated_at) as sync_percentage
+        FROM sync_state
+        WHERE id = 1
+      `);
 
       // Use uniqExact() for accurate counts without expensive FINAL
       // This counts unique primary key combinations without full table deduplication
@@ -153,7 +430,7 @@ export class ClickHouseAPIServer {
 
       const currentHeight = syncState?.current_height ?? 0;
       const chainHeight = chainInfo?.headers ?? syncState?.chain_height ?? 0;
-      const synced = currentHeight >= chainHeight - 1;
+      const synced = chainHeight > 0 ? currentHeight >= chainHeight : false;
       const percentage = syncState?.sync_percentage ?? (chainHeight > 0 ? (currentHeight / chainHeight) * 100 : 0);
 
       // Response format expected by frontend (FluxIndexerApiResponse)
@@ -210,7 +487,16 @@ export class ClickHouseAPIServer {
         sync_percentage: number;
         is_syncing: number;
         blocks_per_second: number;
-      }>('SELECT * FROM sync_state FINAL WHERE id = 1');
+      }>(`
+        SELECT
+          argMax(current_height, updated_at) as current_height,
+          argMax(chain_height, updated_at) as chain_height,
+          argMax(sync_percentage, updated_at) as sync_percentage,
+          argMax(is_syncing, updated_at) as is_syncing,
+          argMax(blocks_per_second, updated_at) as blocks_per_second
+        FROM sync_state
+        WHERE id = 1
+      `);
 
       const currentHeight = syncState?.current_height ?? 0;
       const chainHeight = syncState?.chain_height ?? 0;
@@ -221,7 +507,7 @@ export class ClickHouseAPIServer {
       res.json({
         indexer: {
           syncing: isSyncing,
-          synced: currentHeight >= chainHeight - 1,
+          synced: chainHeight > 0 ? currentHeight >= chainHeight : false,
           currentHeight,
           chainHeight,
           progress: `${currentHeight}/${chainHeight}`,
@@ -245,19 +531,56 @@ export class ClickHouseAPIServer {
 
   private async getBlocks(req: Request, res: Response): Promise<void> {
     try {
-      const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
-      const offset = parseInt(req.query.offset as string) || 0;
+      const limitResult = ClickHouseAPIServer.parseBoundedInt(req.query.limit, {
+        name: 'limit',
+        defaultValue: 20,
+        min: 1,
+        max: 100,
+      });
+      if (limitResult.error) {
+        res.status(400).json({ error: limitResult.error });
+        return;
+      }
+      const limit = limitResult.value ?? 20;
 
-      // Use GROUP BY to deduplicate without expensive FINAL
-      const blocks = await this.ch.query<any>(`
-        SELECT height, hash, timestamp, tx_count, size, producer, difficulty
+      const offsetResult = ClickHouseAPIServer.parseBoundedInt(req.query.offset, {
+        name: 'offset',
+        defaultValue: 0,
+        min: 0,
+        max: 5_000_000,
+      });
+      if (offsetResult.error) {
+        res.status(400).json({ error: offsetResult.error });
+        return;
+      }
+      const offset = offsetResult.value ?? 0;
+
+      // Avoid FINAL but still read the latest row per height.
+      // Use a height window based on requested offset to keep scans bounded.
+      const tip = await this.ch.queryOne<{ height: number }>(`
+        SELECT height
         FROM blocks
         WHERE is_valid = 1
-        GROUP BY height, hash, timestamp, tx_count, size, producer, difficulty
+        ORDER BY height DESC
+        LIMIT 1
+      `);
+      const tipHeight = tip?.height ?? 0;
+      const maxHeight = Math.max(0, tipHeight - offset);
+      const minHeight = Math.max(0, maxHeight - (limit + 250));
+
+      const blocks = await this.ch.query<any>(`
+        SELECT height, hash, timestamp, tx_count, size, producer, difficulty
+        FROM (
+          SELECT height, hash, timestamp, tx_count, size, producer, difficulty, is_valid
+          FROM blocks
+          WHERE height <= {maxHeight:UInt32} AND height > {minHeight:UInt32}
+          ORDER BY height DESC, _version DESC
+          LIMIT 1 BY height
+        )
+        WHERE is_valid = 1
         ORDER BY height DESC
         LIMIT ${limit}
-        OFFSET ${offset}
-      `);
+      `, { maxHeight, minHeight });
 
       const totalResult = await this.ch.queryOne<{ count: number }>('SELECT uniqExact(height) as count FROM blocks WHERE is_valid = 1');
 
@@ -276,17 +599,43 @@ export class ClickHouseAPIServer {
 
   private async getLatestBlocks(req: Request, res: Response): Promise<void> {
     try {
-      const limit = Math.min(parseInt(req.query.limit as string) || 10, 50);
+      const limitResult = ClickHouseAPIServer.parseBoundedInt(req.query.limit, {
+        name: 'limit',
+        defaultValue: 10,
+        min: 1,
+        max: 50,
+      });
+      if (limitResult.error) {
+        res.status(400).json({ error: limitResult.error });
+        return;
+      }
+      const limit = limitResult.value ?? 10;
 
-      // Step 1: Get latest blocks - use GROUP BY to deduplicate without expensive FINAL
-      const blocks = await this.ch.query<any>(`
-        SELECT height, hash, timestamp, tx_count, size, producer
+      const tip = await this.ch.queryOne<{ height: number }>(`
+        SELECT height
         FROM blocks
         WHERE is_valid = 1
-        GROUP BY height, hash, timestamp, tx_count, size, producer
+        ORDER BY height DESC
+        LIMIT 1
+      `);
+      const tipHeight = tip?.height ?? 0;
+      const maxHeightBound = tipHeight;
+      const minHeightBound = Math.max(0, maxHeightBound - (limit + 250));
+
+      // Step 1: Get latest blocks (latest row per height) without FINAL.
+      const blocks = await this.ch.query<any>(`
+        SELECT height, hash, timestamp, tx_count, size, producer
+        FROM (
+          SELECT height, hash, timestamp, tx_count, size, producer, is_valid
+          FROM blocks
+          WHERE height <= {maxHeight:UInt32} AND height > {minHeight:UInt32}
+          ORDER BY height DESC, _version DESC
+          LIMIT 1 BY height
+        )
+        WHERE is_valid = 1
         ORDER BY height DESC
         LIMIT ${limit}
-      `);
+      `, { maxHeight: maxHeightBound, minHeight: minHeightBound });
 
       if (blocks.length === 0) {
         res.json({ blocks: [] });
@@ -305,16 +654,26 @@ export class ClickHouseAPIServer {
         fluxnode_start_count: string;
         fluxnode_confirm_count: string;
       }>(`
+        WITH latest AS (
+          SELECT txid, block_height, is_fluxnode_tx, fluxnode_type
+          FROM (
+            SELECT txid, block_height, is_fluxnode_tx, fluxnode_type, is_valid
+            FROM transactions
+            WHERE block_height >= {minHeight:UInt32} AND block_height <= {maxHeight:UInt32}
+            ORDER BY txid, _version DESC
+            LIMIT 1 BY txid
+          )
+          WHERE is_valid = 1
+        )
         SELECT
           block_height,
-          toString(uniqExactIf((txid, block_height), is_fluxnode_tx = 0)) as regular_count,
-          toString(uniqExactIf((txid, block_height), is_fluxnode_tx = 1)) as fluxnode_count,
-          toString(uniqExactIf((txid, block_height), fluxnode_type = 2)) as fluxnode_start_count,
-          toString(uniqExactIf((txid, block_height), fluxnode_type = 4)) as fluxnode_confirm_count
-        FROM transactions
-        WHERE block_height >= ${minHeight} AND block_height <= ${maxHeight} AND is_valid = 1
+          toString(countIf(is_fluxnode_tx = 0)) as regular_count,
+          toString(countIf(is_fluxnode_tx = 1)) as fluxnode_count,
+          toString(countIf(fluxnode_type = 2)) as fluxnode_start_count,
+          toString(countIf(fluxnode_type = 4)) as fluxnode_confirm_count
+        FROM latest
         GROUP BY block_height
-      `);
+      `, { minHeight, maxHeight });
 
       // Step 3: Get FluxNode tier counts from fluxnode_transactions
       const tierCountsQuery = await this.ch.query<{
@@ -323,15 +682,25 @@ export class ClickHouseAPIServer {
         nimbus_count: string;
         stratus_count: string;
       }>(`
+        WITH latest AS (
+          SELECT txid, block_height, benchmark_tier, type
+          FROM (
+            SELECT txid, block_height, benchmark_tier, type, is_valid
+            FROM fluxnode_transactions
+            WHERE block_height >= {minHeight:UInt32} AND block_height <= {maxHeight:UInt32}
+            ORDER BY txid, _version DESC
+            LIMIT 1 BY txid
+          )
+          WHERE is_valid = 1 AND type = 4
+        )
         SELECT
           block_height,
-          toString(uniqExactIf((txid, block_height), benchmark_tier = 'CUMULUS')) as cumulus_count,
-          toString(uniqExactIf((txid, block_height), benchmark_tier = 'NIMBUS')) as nimbus_count,
-          toString(uniqExactIf((txid, block_height), benchmark_tier = 'STRATUS')) as stratus_count
-        FROM fluxnode_transactions
-        WHERE block_height >= ${minHeight} AND block_height <= ${maxHeight} AND is_valid = 1 AND type = 4
+          toString(countIf(benchmark_tier = 'CUMULUS')) as cumulus_count,
+          toString(countIf(benchmark_tier = 'NIMBUS')) as nimbus_count,
+          toString(countIf(benchmark_tier = 'STRATUS')) as stratus_count
+        FROM latest
         GROUP BY block_height
-      `);
+      `, { minHeight, maxHeight });
 
       // Build lookup maps
       const txCountMap = new Map<number, {
@@ -406,11 +775,34 @@ export class ClickHouseAPIServer {
 
   private async getBlocksRange(req: Request, res: Response): Promise<void> {
     try {
-      const start = parseInt(req.query.start as string);
-      const end = parseInt(req.query.end as string);
+      const startResult = ClickHouseAPIServer.parseBoundedInt(req.query.start, {
+        name: 'start',
+        required: true,
+        min: 0,
+        max: 0xffffffff,
+        clamp: false,
+      });
+      if (startResult.error) {
+        res.status(400).json({ error: startResult.error });
+        return;
+      }
+      const start = startResult.value as number;
 
-      if (isNaN(start) || isNaN(end)) {
-        res.status(400).json({ error: 'start and end parameters are required' });
+      const endResult = ClickHouseAPIServer.parseBoundedInt(req.query.end, {
+        name: 'end',
+        required: true,
+        min: 0,
+        max: 0xffffffff,
+        clamp: false,
+      });
+      if (endResult.error) {
+        res.status(400).json({ error: endResult.error });
+        return;
+      }
+      const end = endResult.value as number;
+
+      if (end < start) {
+        res.status(400).json({ error: 'end must be >= start' });
         return;
       }
 
@@ -419,12 +811,17 @@ export class ClickHouseAPIServer {
         return;
       }
 
-      // Use GROUP BY to deduplicate without expensive FINAL
+      // Return the latest row per height without FINAL.
       const blocks = await this.ch.query<any>(`
         SELECT height, hash, timestamp, tx_count, size, producer, producer_reward, difficulty
-        FROM blocks
-        WHERE height >= {start:UInt32} AND height <= {end:UInt32} AND is_valid = 1
-        GROUP BY height, hash, timestamp, tx_count, size, producer, producer_reward, difficulty
+        FROM (
+          SELECT height, hash, timestamp, tx_count, size, producer, producer_reward, difficulty, is_valid
+          FROM blocks
+          WHERE height >= {start:UInt32} AND height <= {end:UInt32}
+          ORDER BY height ASC, _version DESC
+          LIMIT 1 BY height
+        )
+        WHERE is_valid = 1
         ORDER BY height ASC
       `, { start, end });
 
@@ -439,37 +836,55 @@ export class ClickHouseAPIServer {
       const { heightOrHash } = req.params;
       const isHeight = /^\d+$/.test(heightOrHash);
 
-      // Single-row lookups by primary key - use LIMIT 1 instead of FINAL
+      // Single-row lookups by primary key - pick the latest version without FINAL.
       let block: any;
       if (isHeight) {
+        const height = parseInt(heightOrHash, 10);
+        if (!Number.isFinite(height) || height < 0 || height > 0xffffffff) {
+          res.status(400).json({ error: 'Invalid block height' });
+          return;
+        }
         block = await this.ch.queryOne<any>(`
           SELECT * FROM blocks
-          WHERE height = {height:UInt32} AND is_valid = 1
+          WHERE height = {height:UInt32}
+          ORDER BY _version DESC
           LIMIT 1
-        `, { height: parseInt(heightOrHash) });
+        `, { height });
       } else {
+        const trimmed = heightOrHash.trim();
+        if (!ClickHouseAPIServer.TXID_REGEX.test(trimmed)) {
+          res.status(400).json({ error: 'Invalid block hash (must be 1-64 hex chars)' });
+          return;
+        }
+        const hash = trimmed.toLowerCase().padStart(64, '0');
         block = await this.ch.queryOne<any>(`
           SELECT * FROM blocks
-          WHERE hash = {hash:FixedString(64)} AND is_valid = 1
+          WHERE hash = {hash:FixedString(64)}
+          ORDER BY _version DESC
           LIMIT 1
-        `, { hash: heightOrHash.padStart(64, '0') });
+        `, { hash });
       }
 
-      if (!block) {
+      if (!block || block.is_valid !== 1) {
         res.status(404).json({ error: 'Block not found' });
         return;
       }
 
-      // Get transactions for this block - use GROUP BY to deduplicate without expensive FINAL
+      // Get transactions for this block - latest row per txid without FINAL.
       const transactions = await this.ch.query<any>(`
         SELECT txid, tx_index, timestamp, input_count, output_count,
                input_total, output_total, fee, is_coinbase,
                is_fluxnode_tx, fluxnode_type, size, is_shielded, version
-        FROM transactions
-        WHERE block_height = {height:UInt32} AND is_valid = 1
-        GROUP BY txid, tx_index, timestamp, input_count, output_count,
+        FROM (
+          SELECT txid, tx_index, timestamp, input_count, output_count,
                  input_total, output_total, fee, is_coinbase,
-                 is_fluxnode_tx, fluxnode_type, size, is_shielded, version
+                 is_fluxnode_tx, fluxnode_type, size, is_shielded, version, is_valid
+          FROM transactions
+          WHERE block_height = {height:UInt32}
+          ORDER BY txid, _version DESC
+          LIMIT 1 BY txid
+        )
+        WHERE is_valid = 1
         ORDER BY tx_index
       `, { height: block.height });
 
@@ -482,21 +897,40 @@ export class ClickHouseAPIServer {
           ip_address: string;
         }>(`
           SELECT txid, benchmark_tier, ip_address
-          FROM fluxnode_transactions
-          WHERE block_height = {height:UInt32} AND is_valid = 1
+          FROM (
+            SELECT txid, benchmark_tier, ip_address, is_valid
+            FROM fluxnode_transactions
+            WHERE block_height = {height:UInt32}
+            ORDER BY txid, _version DESC
+            LIMIT 1 BY txid
+          )
+          WHERE is_valid = 1
         `, { height: block.height }),
         // Get first output (vout=0) for each transaction - the "to" address
         this.ch.query<{ txid: string; address: string; value: string }>(`
           SELECT txid, address, value
-          FROM utxos
-          WHERE block_height = {height:UInt32} AND vout = 0
+          FROM (
+            SELECT txid, address, value
+            FROM utxos
+            WHERE block_height = {height:UInt32} AND vout = 0
+            ORDER BY txid, version DESC
+            LIMIT 1 BY txid
+          )
         `, { height: block.height }),
         // Get first input for each transaction - find UTXOs spent in this block
         // Use spent_block_height directly instead of subquery for better performance
         this.ch.query<{ spent_txid: string; address: string; value: string }>(`
           SELECT spent_txid, address, value
-          FROM utxos
-          WHERE spent_block_height = {height:UInt32} AND spent = 1
+          FROM (
+            SELECT spent_txid, address, value, vout
+            FROM (
+              SELECT txid, vout, spent_txid, address, value
+              FROM utxos
+              WHERE spent_block_height = {height:UInt32} AND spent = 1
+              ORDER BY txid, vout, version DESC
+              LIMIT 1 BY txid, vout
+            )
+          )
           ORDER BY spent_txid, vout
         `, { height: block.height }),
       ]);
@@ -521,13 +955,31 @@ export class ClickHouseAPIServer {
         }
       }
 
-      // Get next/prev block hashes - use LIMIT 1 instead of FINAL for single lookups
+      // Get next/prev block hashes (latest version per height) without FINAL.
       const [prevBlock, nextBlock] = await Promise.all([
         block.height > 0 ? this.ch.queryOne<{ hash: string }>(`
-          SELECT hash FROM blocks WHERE height = {h:UInt32} AND is_valid = 1 LIMIT 1
+          SELECT hash
+          FROM (
+            SELECT hash, is_valid
+            FROM blocks
+            WHERE height = {h:UInt32}
+            ORDER BY _version DESC
+            LIMIT 1
+          )
+          WHERE is_valid = 1
+          LIMIT 1
         `, { h: block.height - 1 }) : null,
         this.ch.queryOne<{ hash: string }>(`
-          SELECT hash FROM blocks WHERE height = {h:UInt32} AND is_valid = 1 LIMIT 1
+          SELECT hash
+          FROM (
+            SELECT hash, is_valid
+            FROM blocks
+            WHERE height = {h:UInt32}
+            ORDER BY _version DESC
+            LIMIT 1
+          )
+          WHERE is_valid = 1
+          LIMIT 1
         `, { h: block.height + 1 }),
       ]);
 
@@ -641,7 +1093,10 @@ export class ClickHouseAPIServer {
         confirmations: (chainHeight?.h ?? block.height) - block.height + 1,
         previousBlockHash: prevBlock?.hash ?? null,  // Keep full 64-char hash
         nextBlockHash: nextBlock?.hash ?? null,  // Keep full 64-char hash
-        reward: block.producer_reward ? Number(block.producer_reward) / 1e8 : 0,
+        reward: block.producer_reward ? block.producer_reward.toString() : '0',
+        rewardFlux: block.producer_reward
+          ? ClickHouseAPIServer.zatoshisToFluxNumber(BigInt(block.producer_reward.toString()))
+          : 0,
         txCount: block.tx_count,
         producer: block.producer || null,
         // Transaction IDs array (for backward compat)
@@ -681,32 +1136,64 @@ export class ClickHouseAPIServer {
         return;
       }
 
-      const paddedTxids = txids.map((t: string) => t.padStart(64, '0'));
-      const inClause = paddedTxids.map((t: string) => `'${t}'`).join(', ');
+      const paddedTxids: string[] = [];
+      for (const [idx, rawTxid] of txids.entries()) {
+        if (typeof rawTxid !== 'string') {
+          res.status(400).json({ error: `Invalid txid at index ${idx} (must be a string)` });
+          return;
+        }
+        const trimmed = rawTxid.trim();
+        if (!ClickHouseAPIServer.TXID_REGEX.test(trimmed)) {
+          res.status(400).json({ error: `Invalid txid at index ${idx} (must be 1-64 hex chars)` });
+          return;
+        }
+        paddedTxids.push(trimmed.toLowerCase().padStart(64, '0'));
+      }
+      const uniqueTxids = Array.from(new Set(paddedTxids));
 
-      // Don't use FINAL for targeted IN lookups - duplicates rare and acceptable vs OOM
+      // Don't use FINAL for targeted IN lookups - pick latest row per txid.
       const transactions = await this.ch.query<any>(`
         SELECT txid, block_height, timestamp, input_count, output_count,
                input_total, output_total, fee, is_coinbase, is_shielded
-        FROM transactions
-        WHERE txid IN (${inClause}) AND is_valid = 1
-      `);
+        FROM (
+          SELECT txid, block_height, timestamp, input_count, output_count,
+                 input_total, output_total, fee, is_coinbase, is_shielded, is_valid
+          FROM transactions
+          WHERE txid IN {txids:Array(FixedString(64))}
+          ORDER BY txid, _version DESC
+          LIMIT 1 BY txid
+        )
+        WHERE is_valid = 1
+      `, { txids: uniqueTxids });
 
       // Get outputs (first output per transaction for display)
       const outputs = await this.ch.query<{ txid: string; address: string; value: string }>(`
         SELECT txid, address, value
-        FROM utxos
-        WHERE txid IN (${inClause}) AND vout = 0
-      `);
+        FROM (
+          SELECT txid, address, value
+          FROM utxos
+          WHERE txid IN {txids:Array(FixedString(64))} AND vout = 0
+          ORDER BY txid, version DESC
+          LIMIT 1 BY txid
+        )
+      `, { txids: uniqueTxids });
       const outputMap = new Map(outputs.map(o => [o.txid, o]));
 
       // Get inputs (first input per transaction - the spending UTXO)
       const inputs = await this.ch.query<{ spent_txid: string; address: string; value: string }>(`
         SELECT spent_txid, address, value
-        FROM utxos
-        WHERE spent_txid IN (${inClause})
+        FROM (
+          SELECT spent_txid, address, value, vout
+          FROM (
+            SELECT txid, vout, spent_txid, address, value
+            FROM utxos
+            WHERE spent_txid IN {txids:Array(FixedString(64))}
+            ORDER BY txid, vout, version DESC
+            LIMIT 1 BY txid, vout
+          )
+        )
         ORDER BY spent_txid, vout
-      `);
+      `, { txids: uniqueTxids });
       // Group by spent_txid, take first for each
       const inputMap = new Map<string, { address: string; value: string }>();
       for (const inp of inputs) {
@@ -782,16 +1269,22 @@ export class ClickHouseAPIServer {
     try {
       const { txid } = req.params;
       const includeHex = req.query.includeHex === 'true';
-      const paddedTxid = txid.padStart(64, '0');
+      const trimmedTxid = txid.trim();
+      if (!ClickHouseAPIServer.TXID_REGEX.test(trimmedTxid)) {
+        res.status(400).json({ error: 'Invalid txid (must be 1-64 hex chars)' });
+        return;
+      }
+      const paddedTxid = trimmedTxid.toLowerCase().padStart(64, '0');
 
-      // Direct lookup - don't use FINAL, it loads entire table into memory
+      // Direct lookup - pick latest row per txid without FINAL.
       const tx = await this.ch.queryOne<any>(`
         SELECT * FROM transactions
-        WHERE txid = {txid:FixedString(64)} AND is_valid = 1
+        WHERE txid = {txid:FixedString(64)}
+        ORDER BY _version DESC
         LIMIT 1
       `, { txid: paddedTxid });
 
-      if (!tx) {
+      if (!tx || tx.is_valid !== 1) {
         res.status(404).json({ error: 'Transaction not found' });
         return;
       }
@@ -801,23 +1294,40 @@ export class ClickHouseAPIServer {
       // For specific txid lookups, duplicates are rare and acceptable vs OOM risk
       const outputs = await this.ch.query<any>(`
         SELECT vout, address, value, script_type, script_pubkey, spent, spent_txid, spent_block_height
-        FROM utxos
-        WHERE txid = {txid:FixedString(64)}
+        FROM (
+          SELECT vout, address, value, script_type, script_pubkey, spent, spent_txid, spent_block_height
+          FROM utxos
+          WHERE txid = {txid:FixedString(64)}
+          ORDER BY vout, version DESC
+          LIMIT 1 BY vout
+        )
         ORDER BY vout
       `, { txid: paddedTxid });
 
       // Get inputs by finding UTXOs that were spent by this transaction
       const inputs = await this.ch.query<any>(`
         SELECT txid as prev_txid, vout as prev_vout, address, value, script_type
-        FROM utxos
-        WHERE spent_txid = {txid:FixedString(64)}
-        ORDER BY vout
+        FROM (
+          SELECT txid, vout, address, value, script_type
+          FROM utxos
+          WHERE spent_txid = {txid:FixedString(64)}
+          ORDER BY txid, vout, version DESC
+          LIMIT 1 BY txid, vout
+        )
+        ORDER BY prev_vout
       `, { txid: paddedTxid });
 
       // Get block info for confirmations
       const block = await this.ch.queryOne<{ hash: string; timestamp: number }>(`
-        SELECT hash, timestamp FROM blocks
-        WHERE height = {h:UInt32} AND is_valid = 1
+        SELECT hash, timestamp
+        FROM (
+          SELECT hash, timestamp, is_valid
+          FROM blocks
+          WHERE height = {h:UInt32}
+          ORDER BY _version DESC
+          LIMIT 1
+        )
+        WHERE is_valid = 1
         LIMIT 1
       `, { h: tx.block_height });
 
@@ -871,22 +1381,70 @@ export class ClickHouseAPIServer {
         fees: tx.fee.toString(),
       };
 
+      // Add FluxNode metadata from indexed table (avoids fragile frontend hex parsing).
+      if (tx.is_fluxnode_tx === 1) {
+        const fluxnodeTx = await this.ch.queryOne<{
+          type: number;
+          collateral_hash: string;
+          collateral_index: number;
+          ip_address: string;
+          public_key: string;
+          signature: string;
+          p2sh_address: string;
+          benchmark_tier: string;
+        }>(`
+          SELECT type, collateral_hash, collateral_index, ip_address, public_key, signature, p2sh_address, benchmark_tier
+          FROM (
+            SELECT type, collateral_hash, collateral_index, ip_address, public_key, signature, p2sh_address, benchmark_tier, is_valid
+            FROM fluxnode_transactions
+            WHERE txid = {txid:FixedString(64)}
+            ORDER BY _version DESC
+            LIMIT 1
+          )
+          WHERE is_valid = 1
+          LIMIT 1
+        `, { txid: paddedTxid });
+
+        const nType = fluxnodeTx?.type ?? (tx.fluxnode_type ?? null);
+        response.nType = typeof nType === 'number' ? nType : null;
+
+        const collateralHash = fluxnodeTx?.collateral_hash?.trim() || '';
+        if (collateralHash) {
+          response.collateralOutputHash = collateralHash;
+          response.collateralOutputIndex = Number(fluxnodeTx?.collateral_index ?? 0);
+        }
+
+        const benchmarkTier = fluxnodeTx?.benchmark_tier?.trim() || '';
+        response.benchmarkTier = benchmarkTier || null;
+
+        const ip = fluxnodeTx?.ip_address?.trim() || '';
+        response.ip = ip || null;
+
+        const pubKey = fluxnodeTx?.public_key?.trim() || '';
+        response.fluxnodePubKey = pubKey || null;
+
+        const sig = fluxnodeTx?.signature?.trim() || '';
+        response.sig = sig || null;
+
+        const p2shAddress = fluxnodeTx?.p2sh_address?.trim() || '';
+        response.p2shAddress = p2shAddress || null;
+      }
+
       // Add hex if requested (fetch from daemon via RPC)
       if (includeHex) {
         try {
           // verbose=false returns raw hex string instead of decoded object
-          // Flux daemon doesn't support blockhash parameter, requires txindex=1
-          const rawTx = await this.rpc.getRawTransaction(req.params.txid, false);
+          // For mined txs, this can fail when txindex=0 (Flux daemon does not support the blockhash parameter)
+          const rawTx = await this.rpc.getRawTransaction(paddedTxid, false);
           response.hex = typeof rawTx === 'string' ? rawTx : '';
         } catch (err: any) {
-          // Flux daemon returns HTTP 500 for many transactions without txindex
-          // Fallback: Extract from raw block hex instead
+          // Fallback: Extract from raw block hex instead (works with txindex=0)
           const blockhash = block?.hash?.trim();
           if (blockhash) {
             try {
               logger.debug('Extracting tx hex from block', { txid: req.params.txid, blockhash });
               const rawBlockHex = await this.rpc.getBlock(blockhash, 0) as unknown as string;
-              const txHex = extractTransactionFromBlock(rawBlockHex, req.params.txid, tx.block_height);
+              const txHex = extractTransactionFromBlock(rawBlockHex, paddedTxid, tx.block_height);
 
               if (txHex && txHex.length > 0) {
                 response.hex = txHex;
@@ -930,7 +1488,7 @@ export class ClickHouseAPIServer {
       const { address } = req.params;
 
       // Query address summary and live FluxNode data in parallel
-      const [summary, fluxnodeData] = await Promise.all([
+      const [summary, fluxnodeData, mempoolDeltas] = await Promise.all([
         // Address balance/tx data from aggregated table
         this.ch.queryOne<any>(`
           SELECT
@@ -951,37 +1509,26 @@ export class ClickHouseAPIServer {
           FROM live_fluxnodes FINAL
           WHERE address = {address:String}
         `, { address }),
+        this.getMempoolAddressDeltas(),
       ]);
 
-      if (!summary) {
-        // Return empty address info (format expected by frontend: FluxIndexerAddressResponse)
-        res.json({
-          address,
-          balance: '0',
-          totalReceived: '0',
-          totalSent: '0',
-          unconfirmedBalance: '0',
-          unconfirmedTxs: 0,
-          txs: 0,
-        });
-        return;
-      }
+      const mempoolDelta = mempoolDeltas.get(address) ?? { balanceDelta: BigInt(0), txCount: 0 };
 
       // Response format expected by frontend (FluxIndexerAddressResponse)
       // Values as strings (satoshis) for precision
       res.json({
         address,
-        balance: summary.balance.toString(),
-        totalReceived: summary.received_total.toString(),
-        totalSent: summary.sent_total.toString(),
-        unconfirmedBalance: '0',
-        unconfirmedTxs: 0,
-        txs: summary.tx_count,
+        balance: summary ? summary.balance.toString() : '0',
+        totalReceived: summary ? summary.received_total.toString() : '0',
+        totalSent: summary ? summary.sent_total.toString() : '0',
+        unconfirmedBalance: mempoolDelta.balanceDelta.toString(),
+        unconfirmedTxs: mempoolDelta.txCount,
+        txs: summary ? summary.tx_count : 0,
         // Additional fields for convenience
-        balanceFlux: Number(summary.balance) / 1e8,
-        txCount: summary.tx_count,
-        firstSeen: summary.first_seen,
-        lastActivity: summary.last_activity,
+        balanceFlux: summary ? ClickHouseAPIServer.zatoshisToFluxNumber(BigInt(summary.balance.toString())) : 0,
+        txCount: summary ? summary.tx_count : 0,
+        firstSeen: summary ? summary.first_seen : null,
+        lastActivity: summary ? summary.last_activity : null,
         // FluxNode counts from live_fluxnodes table (flat structure for frontend compatibility)
         cumulusCount: fluxnodeData?.cumulus_count || 0,
         nimbusCount: fluxnodeData?.nimbus_count || 0,
@@ -996,47 +1543,144 @@ export class ClickHouseAPIServer {
     try {
       const { address } = req.params;
       // Allow higher limit for CSV exports (up to 10000), default 25 for normal pagination
-      const limit = Math.min(parseInt(req.query.limit as string) || 25, 10000);
-      const offset = parseInt(req.query.offset as string) || 0;
+      const limitResult = ClickHouseAPIServer.parseBoundedInt(req.query.limit, {
+        name: 'limit',
+        defaultValue: 25,
+        min: 1,
+        max: 10000,
+      });
+      if (limitResult.error) {
+        res.status(400).json({ error: limitResult.error });
+        return;
+      }
+      const limit = limitResult.value ?? 25;
+
+      const offsetResult = ClickHouseAPIServer.parseBoundedInt(req.query.offset, {
+        name: 'offset',
+        defaultValue: 0,
+        min: 0,
+        max: 100000,
+        clamp: false,
+      });
+      if (offsetResult.error) {
+        res.status(400).json({ error: offsetResult.error });
+        return;
+      }
+      const offset = offsetResult.value ?? 0;
 
       // Cursor-based pagination (efficient for ClickHouse - no OFFSET scanning)
-      const cursorHeight = req.query.cursorHeight ? parseInt(req.query.cursorHeight as string) : undefined;
-      const cursorTxid = req.query.cursorTxid as string | undefined;
+      const cursorHeightResult = ClickHouseAPIServer.parseBoundedInt(req.query.cursorHeight, {
+        name: 'cursorHeight',
+        min: 0,
+        max: 0xffffffff,
+        clamp: false,
+      });
+      if (cursorHeightResult.error) {
+        res.status(400).json({ error: cursorHeightResult.error });
+        return;
+      }
+      const cursorHeight = cursorHeightResult.value;
+
+      const cursorTxIndexResult = ClickHouseAPIServer.parseBoundedInt(req.query.cursorTxIndex, {
+        name: 'cursorTxIndex',
+        min: 0,
+        max: 65535,
+      });
+      if (cursorTxIndexResult.error) {
+        res.status(400).json({ error: cursorTxIndexResult.error });
+        return;
+      }
+      const cursorTxIndex = cursorTxIndexResult.value;
+
+      const cursorTxidRaw = ClickHouseAPIServer.coerceStringParam(req.query.cursorTxid);
+      const cursorTxid = cursorTxidRaw?.trim() || undefined;
+      if (cursorTxid !== undefined && !ClickHouseAPIServer.TXID_REGEX.test(cursorTxid)) {
+        res.status(400).json({ error: 'Invalid cursorTxid (must be 1-64 hex chars)' });
+        return;
+      }
 
       // Timestamp filtering for date range exports
-      const fromTimestamp = req.query.fromTimestamp ? parseInt(req.query.fromTimestamp as string) : undefined;
-      const toTimestamp = req.query.toTimestamp ? parseInt(req.query.toTimestamp as string) : undefined;
+      const fromTimestampResult = ClickHouseAPIServer.parseBoundedInt(req.query.fromTimestamp, {
+        name: 'fromTimestamp',
+        min: 0,
+        max: 0xffffffff,
+        clamp: false,
+      });
+      if (fromTimestampResult.error) {
+        res.status(400).json({ error: fromTimestampResult.error });
+        return;
+      }
+      const fromTimestamp = fromTimestampResult.value;
 
-      // Build query with optional cursor and timestamp filters
-      let whereClause = 'address = {address:String} AND is_valid = 1';
+      const toTimestampResult = ClickHouseAPIServer.parseBoundedInt(req.query.toTimestamp, {
+        name: 'toTimestamp',
+        min: 0,
+        max: 0xffffffff,
+        clamp: false,
+      });
+      if (toTimestampResult.error) {
+        res.status(400).json({ error: toTimestampResult.error });
+        return;
+      }
+      const toTimestamp = toTimestampResult.value;
+
+      if (fromTimestamp !== undefined && toTimestamp !== undefined && fromTimestamp > toTimestamp) {
+        res.status(400).json({ error: 'fromTimestamp must be <= toTimestamp' });
+        return;
+      }
+
       const params: Record<string, any> = { address };
+      const resultFilterParts: string[] = [];
+      const filteredCountFilterParts: string[] = [];
 
-      if (cursorHeight !== undefined && cursorTxid) {
+      if (cursorHeight !== undefined && cursorTxid && cursorTxIndex !== undefined) {
         // Cursor-based: get rows after the cursor position
         // ORDER BY (address, block_height DESC, tx_index, txid) matches our schema
-        whereClause += ` AND (block_height < {cursorHeight:UInt32} OR (block_height = {cursorHeight:UInt32} AND txid > {cursorTxid:FixedString(64)}))`;
+        resultFilterParts.push('(block_height < {cursorHeight:UInt32} OR (block_height = {cursorHeight:UInt32} AND (tx_index > {cursorTxIndex:UInt16} OR (tx_index = {cursorTxIndex:UInt16} AND txid > {cursorTxid:FixedString(64)}))))');
+        params.cursorHeight = cursorHeight;
+        params.cursorTxIndex = Math.max(0, Math.min(65535, cursorTxIndex));
+        params.cursorTxid = cursorTxid.padStart(64, '0');
+      } else if (cursorHeight !== undefined && cursorTxid) {
+        // Backwards-compatible cursor: fall back to txid-only when tx_index is not provided.
+        // This can skip/duplicate rows when multiple txs exist at the same height.
+        resultFilterParts.push('(block_height < {cursorHeight:UInt32} OR (block_height = {cursorHeight:UInt32} AND txid > {cursorTxid:FixedString(64)}))');
         params.cursorHeight = cursorHeight;
         params.cursorTxid = cursorTxid.padStart(64, '0');
       }
 
       // Add timestamp range filtering
       if (fromTimestamp !== undefined) {
-        whereClause += ` AND timestamp >= {fromTimestamp:UInt32}`;
+        resultFilterParts.push('timestamp >= {fromTimestamp:UInt32}');
+        filteredCountFilterParts.push('timestamp >= {fromTimestamp:UInt32}');
         params.fromTimestamp = fromTimestamp;
       }
       if (toTimestamp !== undefined) {
-        whereClause += ` AND timestamp <= {toTimestamp:UInt32}`;
+        resultFilterParts.push('timestamp <= {toTimestamp:UInt32}');
+        filteredCountFilterParts.push('timestamp <= {toTimestamp:UInt32}');
         params.toTimestamp = toTimestamp;
       }
 
-      // Step 1: Get address transactions - use GROUP BY to deduplicate without expensive FINAL
+      const resultWhereClause = resultFilterParts.length > 0 ? resultFilterParts.join(' AND ') : '1';
+      const filteredCountWhereClause = filteredCountFilterParts.length > 0 ? filteredCountFilterParts.join(' AND ') : '1';
+
+      // Step 1: Get address transactions - pick latest row per (address, txid) without FINAL.
       const addressTxs = await this.ch.query<any>(`
         SELECT txid, block_height, block_hash, tx_index, timestamp,
                direction, received_value, sent_value, is_coinbase
-        FROM address_transactions
-        WHERE ${whereClause}
-        GROUP BY txid, block_height, block_hash, tx_index, timestamp,
+        FROM (
+          SELECT txid, block_height, block_hash, tx_index, timestamp,
                  direction, received_value, sent_value, is_coinbase
+          FROM (
+            SELECT txid, block_height, block_hash, tx_index, timestamp,
+                   direction, received_value, sent_value, is_coinbase, is_valid
+            FROM address_transactions
+            WHERE address = {address:String}
+            ORDER BY txid, _version DESC
+            LIMIT 1 BY txid
+          )
+          WHERE is_valid = 1
+        )
+        WHERE ${resultWhereClause}
         ORDER BY block_height DESC, tx_index ASC, txid ASC
         LIMIT ${limit + 1}
         ${cursorHeight === undefined && offset > 0 ? `OFFSET ${offset}` : ''}
@@ -1049,12 +1693,18 @@ export class ClickHouseAPIServer {
       // Step 2: Get fee/total data for just these specific transactions (targeted lookup)
       let txDataMap = new Map<string, { fee: string; input_total: string; output_total: string }>();
       if (resultTxs.length > 0) {
-        const txidList = resultTxs.map((tx: any) => `'${tx.txid}'`).join(',');
+        const txids = resultTxs.map((tx: any) => tx.txid);
         const txData = await this.ch.query<any>(`
           SELECT txid, fee, input_total, output_total
-          FROM transactions
-          WHERE txid IN (${txidList}) AND is_valid = 1
-        `);
+          FROM (
+            SELECT txid, fee, input_total, output_total, is_valid
+            FROM transactions
+            WHERE txid IN {txids:Array(FixedString(64))}
+            ORDER BY txid, _version DESC
+            LIMIT 1 BY txid
+          )
+          WHERE is_valid = 1
+        `, { txids });
         for (const td of txData) {
           txDataMap.set(td.txid, { fee: td.fee, input_total: td.input_total, output_total: td.output_total });
         }
@@ -1073,26 +1723,45 @@ export class ClickHouseAPIServer {
       });
 
       // Get total count (unfiltered) and filtered count (with timestamp range)
-      // Use same whereClause for filtered count to respect timestamp filters
       const [totalResult, filteredResult] = await Promise.all([
         this.ch.queryOne<{ count: number }>(`
-          SELECT uniqExact(txid, block_height) as count
-          FROM address_transactions
-          WHERE address = {address:String} AND is_valid = 1
+          SELECT count() as count
+          FROM (
+            SELECT txid
+            FROM (
+              SELECT txid, is_valid
+              FROM address_transactions
+              WHERE address = {address:String}
+              ORDER BY txid, _version DESC
+              LIMIT 1 BY txid
+            )
+            WHERE is_valid = 1
+          )
         `, { address }),
         this.ch.queryOne<{ count: number }>(`
-          SELECT uniqExact(txid, block_height) as count
-          FROM address_transactions
-          WHERE ${whereClause}
+          SELECT count() as count
+          FROM (
+            SELECT txid, timestamp
+            FROM (
+              SELECT txid, timestamp, is_valid
+              FROM address_transactions
+              WHERE address = {address:String}
+              ORDER BY txid, _version DESC
+              LIMIT 1 BY txid
+            )
+            WHERE is_valid = 1
+          )
+          WHERE ${filteredCountWhereClause}
         `, params),
       ]);
 
       // Build next cursor if there are more results
-      let nextCursor: { height: number; txid: string } | undefined;
+      let nextCursor: { height: number; txIndex: number; txid: string } | undefined;
       if (hasMore && transactions.length > 0) {
         const lastTx = transactions[transactions.length - 1];
         nextCursor = {
           height: lastTx.block_height,
+          txIndex: lastTx.tx_index,
           txid: lastTx.txid,  // Keep full 64-char txid
         };
       }
@@ -1163,12 +1832,17 @@ export class ClickHouseAPIServer {
     try {
       const { address } = req.params;
 
-      // Use GROUP BY to deduplicate without expensive FINAL
+      // Return latest row per outpoint without FINAL, then filter unspent.
       const utxos = await this.ch.query<any>(`
         SELECT txid, vout, value, script_type, block_height
-        FROM utxos
-        WHERE address = {address:String} AND spent = 0
-        GROUP BY txid, vout, value, script_type, block_height
+        FROM (
+          SELECT txid, vout, value, script_type, block_height, spent
+          FROM utxos
+          WHERE address = {address:String}
+          ORDER BY txid, vout, version DESC
+          LIMIT 1 BY txid, vout
+        )
+        WHERE spent = 0
         ORDER BY block_height DESC
         LIMIT 1000
       `, { address });
@@ -1193,9 +1867,50 @@ export class ClickHouseAPIServer {
   private async getRichList(req: Request, res: Response): Promise<void> {
     try {
       // Support both limit/offset and page/pageSize styles
-      const pageSize = Math.min(parseInt(req.query.pageSize as string) || parseInt(req.query.limit as string) || 100, 1000);
-      const page = Math.max(parseInt(req.query.page as string) || 1, 1);
-      const offset = parseInt(req.query.offset as string) || ((page - 1) * pageSize);
+      const pageSizeResult = ClickHouseAPIServer.parseBoundedInt(req.query.pageSize ?? req.query.limit, {
+        name: 'pageSize',
+        defaultValue: 100,
+        min: 1,
+        max: 1000,
+      });
+      if (pageSizeResult.error) {
+        res.status(400).json({ error: pageSizeResult.error });
+        return;
+      }
+      const pageSize = pageSizeResult.value ?? 100;
+
+      const pageResult = ClickHouseAPIServer.parseBoundedInt(req.query.page, {
+        name: 'page',
+        defaultValue: 1,
+        min: 1,
+        max: 1_000_000,
+      });
+      if (pageResult.error) {
+        res.status(400).json({ error: pageResult.error });
+        return;
+      }
+      const page = pageResult.value ?? 1;
+
+      const MAX_RICHLIST_OFFSET = 100000;
+      let offset = (page - 1) * pageSize;
+
+      if (req.query.offset !== undefined) {
+        const offsetResult = ClickHouseAPIServer.parseBoundedInt(req.query.offset, {
+          name: 'offset',
+          required: true,
+          min: 0,
+          max: MAX_RICHLIST_OFFSET,
+          clamp: false,
+        });
+        if (offsetResult.error) {
+          res.status(400).json({ error: offsetResult.error });
+          return;
+        }
+        offset = offsetResult.value as number;
+      } else if (offset > MAX_RICHLIST_OFFSET) {
+        res.status(400).json({ error: `offset too large (max ${MAX_RICHLIST_OFFSET}); use smaller page/pageSize` });
+        return;
+      }
 
       // Query addresses with balances, then join with live_fluxnodes for node counts
       const addresses = await this.ch.query<any>(`
@@ -1240,13 +1955,14 @@ export class ClickHouseAPIServer {
       `);
 
       const totalAddresses = Number(totalResult?.count ?? 0);
-      const totalSupplySat = Number(totalResult?.total ?? 0);
+      const totalSupplySat = totalResult?.total?.toString() ?? '0';
+      const totalSupplyFlux = ClickHouseAPIServer.zatoshisToFluxNumber(BigInt(totalSupplySat));
 
       // Return format expected by flux-explorer frontend
       res.json({
         lastUpdate: new Date().toISOString(),
         lastBlockHeight: Number(latestBlock?.height ?? 0),
-        totalSupply: totalSupplySat.toString(), // Keep as string in satoshis for explorer compatibility
+        totalSupply: totalSupplySat, // Keep as string in satoshis for explorer compatibility
         totalAddresses,
         page,
         pageSize,
@@ -1266,7 +1982,7 @@ export class ClickHouseAPIServer {
           limit: pageSize,
           offset,
         },
-        totalSupplyFlux: totalSupplySat / 1e8, // Also include FLUX value for convenience
+        totalSupplyFlux, // Also include FLUX value for convenience
       });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -1457,19 +2173,13 @@ export class ClickHouseAPIServer {
       // Max supply is 560 million FLUX
       const maxSupply = BigInt(560000000) * BigInt(100000000); // in zatoshis
 
-      // Helper function to convert zatoshis to FLUX
-      const toFlux = (zatoshis: bigint): string => {
-        const flux = Number(zatoshis) / 100000000;
-        return flux.toString();
-      };
-
       res.json({
         blockHeight,
-        transparentSupply: toFlux(transparentSupply),
-        shieldedPool: toFlux(shieldedPool),
-        circulatingSupply: toFlux(circulatingSupply),
-        totalSupply: toFlux(totalSupply),
-        maxSupply: toFlux(maxSupply),
+        transparentSupply: ClickHouseAPIServer.zatoshisToFluxString(transparentSupply),
+        shieldedPool: ClickHouseAPIServer.zatoshisToFluxString(shieldedPool),
+        circulatingSupply: ClickHouseAPIServer.zatoshisToFluxString(circulatingSupply),
+        totalSupply: ClickHouseAPIServer.zatoshisToFluxString(totalSupply),
+        maxSupply: ClickHouseAPIServer.zatoshisToFluxString(maxSupply),
         timestamp: new Date().toISOString(),
       });
     } catch (error: any) {
@@ -1481,14 +2191,40 @@ export class ClickHouseAPIServer {
 
   private async getProducers(req: Request, res: Response): Promise<void> {
     try {
-      const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
-      const offset = parseInt(req.query.offset as string) || 0;
+      const limitResult = ClickHouseAPIServer.parseBoundedInt(req.query.limit, {
+        name: 'limit',
+        defaultValue: 100,
+        min: 1,
+        max: 500,
+      });
+      if (limitResult.error) {
+        res.status(400).json({ error: limitResult.error });
+        return;
+      }
+      const limit = limitResult.value ?? 100;
 
-      // Use GROUP BY to deduplicate without expensive FINAL
+      const offsetResult = ClickHouseAPIServer.parseBoundedInt(req.query.offset, {
+        name: 'offset',
+        defaultValue: 0,
+        min: 0,
+        max: 100000,
+        clamp: false,
+      });
+      if (offsetResult.error) {
+        res.status(400).json({ error: offsetResult.error });
+        return;
+      }
+      const offset = offsetResult.value ?? 0;
+
+      // Pick the latest row per fluxnode without FINAL.
       const producers = await this.ch.query<any>(`
         SELECT fluxnode, blocks_produced, first_block, last_block, total_rewards
-        FROM producers
-        GROUP BY fluxnode, blocks_produced, first_block, last_block, total_rewards
+        FROM (
+          SELECT fluxnode, blocks_produced, first_block, last_block, total_rewards
+          FROM producers
+          ORDER BY fluxnode, updated_at DESC
+          LIMIT 1 BY fluxnode
+        )
         ORDER BY blocks_produced DESC
         LIMIT ${limit}
         OFFSET ${offset}
@@ -1504,7 +2240,7 @@ export class ClickHouseAPIServer {
           blocksProduced: Number(p.blocks_produced),
           firstBlock: Number(p.first_block),
           lastBlock: Number(p.last_block),
-          totalRewards: Number(p.total_rewards) / 1e8,
+          totalRewards: ClickHouseAPIServer.zatoshisToFluxNumber(BigInt(p.total_rewards.toString())),
         })),
         pagination: {
           total: Number(totalResult?.count ?? 0),
@@ -1521,11 +2257,12 @@ export class ClickHouseAPIServer {
     try {
       const { identifier } = req.params;
 
-      // Single-row lookup - use LIMIT 1 instead of FINAL
+      // Single-row lookup - pick the latest row for this fluxnode without FINAL.
       const producer = await this.ch.queryOne<any>(`
         SELECT fluxnode, blocks_produced, first_block, last_block, total_rewards
         FROM producers
         WHERE fluxnode = {identifier:String}
+        ORDER BY updated_at DESC
         LIMIT 1
       `, { identifier });
 
@@ -1534,22 +2271,48 @@ export class ClickHouseAPIServer {
         return;
       }
 
-      // Get recent blocks - use GROUP BY to deduplicate without expensive FINAL
-      const recentBlocks = await this.ch.query<any>(`
+      // Get recent blocks.
+      // Phase 1: use the producer projection for a fast candidate list.
+      const candidateBlocks = await this.ch.query<any>(`
         SELECT height, hash, timestamp, tx_count
-        FROM blocks
-        WHERE producer = {identifier:String} AND is_valid = 1
-        GROUP BY height, hash, timestamp, tx_count
+        FROM (
+          SELECT height, hash, timestamp, tx_count, is_valid
+          FROM blocks
+          WHERE producer = {identifier:String}
+          ORDER BY height DESC, _version DESC
+          LIMIT 1 BY height
+        )
+        WHERE is_valid = 1
         ORDER BY height DESC
-        LIMIT 10
+        LIMIT 50
       `, { identifier });
+
+      // Phase 2: re-select latest rows for those heights without filtering by producer first
+      // (prevents stale results if a reorg replaced blocks at the same height with a new producer).
+      let recentBlocks: any[] = [];
+      if (candidateBlocks.length > 0) {
+        const heights = candidateBlocks.map((b: any) => b.height);
+        recentBlocks = await this.ch.query<any>(`
+          SELECT height, hash, timestamp, tx_count
+          FROM (
+            SELECT height, hash, timestamp, tx_count, producer, is_valid
+            FROM blocks
+            WHERE height IN {heights:Array(UInt32)}
+            ORDER BY height, _version DESC
+            LIMIT 1 BY height
+          )
+          WHERE is_valid = 1 AND producer = {identifier:String}
+          ORDER BY height DESC
+          LIMIT 10
+        `, { heights, identifier });
+      }
 
       res.json({
         fluxnode: producer.fluxnode,
         blocksProduced: producer.blocks_produced,
         firstBlock: producer.first_block,
         lastBlock: producer.last_block,
-        totalRewards: Number(producer.total_rewards) / 1e8,
+        totalRewards: ClickHouseAPIServer.zatoshisToFluxNumber(BigInt(producer.total_rewards.toString())),
         recentBlocks,
       });
     } catch (error: any) {
@@ -1561,8 +2324,30 @@ export class ClickHouseAPIServer {
 
   private async getFluxNodes(req: Request, res: Response): Promise<void> {
     try {
-      const limit = Math.min(parseInt(req.query.limit as string) || 100, 1000);
-      const offset = parseInt(req.query.offset as string) || 0;
+      const limitResult = ClickHouseAPIServer.parseBoundedInt(req.query.limit, {
+        name: 'limit',
+        defaultValue: 100,
+        min: 1,
+        max: 1000,
+      });
+      if (limitResult.error) {
+        res.status(400).json({ error: limitResult.error });
+        return;
+      }
+      const limit = limitResult.value ?? 100;
+
+      const offsetResult = ClickHouseAPIServer.parseBoundedInt(req.query.offset, {
+        name: 'offset',
+        defaultValue: 0,
+        min: 0,
+        max: 100000,
+        clamp: false,
+      });
+      if (offsetResult.error) {
+        res.status(400).json({ error: offsetResult.error });
+        return;
+      }
+      const offset = offsetResult.value ?? 0;
       const tier = req.query.tier as string;
 
       // Validate tier to prevent SQL injection and build WHERE clause
@@ -1572,25 +2357,37 @@ export class ClickHouseAPIServer {
         tierFilter = `AND benchmark_tier = '${tier.toUpperCase()}'`;
       }
 
-      // Use GROUP BY to deduplicate without expensive FINAL
-      // Filter by is_valid = 1 for reorg handling
+      // Pick the latest row per txid without FINAL, then filter is_valid.
       const nodes = await this.ch.query<any>(`
         SELECT txid, block_height, block_time, type, ip_address, public_key,
                benchmark_tier, p2sh_address
-        FROM fluxnode_transactions
-        WHERE is_valid = 1 ${tierFilter}
-        GROUP BY txid, block_height, block_time, type, ip_address, public_key,
-                 benchmark_tier, p2sh_address
+        FROM (
+          SELECT txid, block_height, block_time, type, ip_address, public_key,
+                 benchmark_tier, p2sh_address, is_valid
+          FROM fluxnode_transactions
+          WHERE 1 = 1 ${tierFilter}
+          ORDER BY txid, _version DESC
+          LIMIT 1 BY txid
+        )
+        WHERE is_valid = 1
         ORDER BY block_height DESC
         LIMIT ${limit}
         OFFSET ${offset}
       `);
 
-      // Use uniqExact() for accurate count without expensive FINAL
       const totalResult = await this.ch.queryOne<{ count: number }>(`
-        SELECT uniqExact(txid, block_height) as count
-        FROM fluxnode_transactions
-        WHERE is_valid = 1 ${tierFilter}
+        SELECT count() as count
+        FROM (
+          SELECT txid
+          FROM (
+            SELECT txid, is_valid
+            FROM fluxnode_transactions
+            WHERE 1 = 1 ${tierFilter}
+            ORDER BY txid, _version DESC
+            LIMIT 1 BY txid
+          )
+          WHERE is_valid = 1
+        )
       `);
 
       res.json({
@@ -1613,13 +2410,19 @@ export class ClickHouseAPIServer {
     try {
       const { ip } = req.params;
 
-      // Single-row lookup with ORDER BY LIMIT 1 - no FINAL needed
-      // Filter by is_valid = 1 for reorg handling
+      // Single-row lookup - pick the latest row per txid without FINAL, then filter is_valid.
       const node = await this.ch.queryOne<any>(`
         SELECT txid, block_height, block_time, type, ip_address, public_key,
                benchmark_tier, p2sh_address, collateral_hash, collateral_index
-        FROM fluxnode_transactions
-        WHERE ip_address = {ip:String} AND is_valid = 1
+        FROM (
+          SELECT txid, block_height, block_time, type, ip_address, public_key,
+                 benchmark_tier, p2sh_address, collateral_hash, collateral_index, is_valid
+          FROM fluxnode_transactions
+          WHERE ip_address = {ip:String}
+          ORDER BY txid, _version DESC
+          LIMIT 1 BY txid
+        )
+        WHERE is_valid = 1
         ORDER BY block_height DESC
         LIMIT 1
       `, { ip });
@@ -1704,34 +2507,63 @@ export class ClickHouseAPIServer {
       const [latestBlocks, avgBlockTime, tx24h] = await Promise.all([
         // Get latest 5 blocks - fast primary key scan
         this.ch.query<any>(`
+          WITH
+            (SELECT max(height) FROM blocks WHERE is_valid = 1) AS maxHeight,
+            toUInt32(greatest(toInt64(maxHeight) - 50, 0)) AS minHeight
           SELECT height, hash, timestamp
-          FROM blocks
+          FROM (
+            SELECT height, hash, timestamp, is_valid
+            FROM blocks
+            WHERE height <= maxHeight AND height > minHeight
+            ORDER BY height DESC, _version DESC
+            LIMIT 1 BY height
+          )
           WHERE is_valid = 1
           ORDER BY height DESC
           LIMIT 5
         `),
         this.ch.queryOne<{ avg_interval: number }>(`
-          WITH recent AS (
-            SELECT height, timestamp, lagInFrame(timestamp) OVER (ORDER BY height) AS prev_timestamp
-            FROM blocks
-            WHERE is_valid = 1
-            GROUP BY height, timestamp
-            ORDER BY height DESC
-            LIMIT 121
-          )
+          WITH
+            (SELECT max(height) FROM blocks WHERE is_valid = 1) AS maxHeight,
+            toUInt32(greatest(toInt64(maxHeight) - 400, 0)) AS minHeight,
+            latest AS (
+              SELECT height, timestamp
+              FROM (
+                SELECT height, timestamp, is_valid
+                FROM blocks
+                WHERE height <= maxHeight AND height > minHeight
+                ORDER BY height DESC, _version DESC
+                LIMIT 1 BY height
+              )
+              WHERE is_valid = 1
+              ORDER BY height DESC
+              LIMIT 121
+            ),
+            recent AS (
+              SELECT height, timestamp, lagInFrame(timestamp) OVER (ORDER BY height) AS prev_timestamp
+              FROM latest
+            )
           SELECT avg(timestamp - prev_timestamp) as avg_interval
           FROM recent
           WHERE prev_timestamp > 0
         `),
         this.ch.queryOne<{ tx_24h: string }>(`
+          WITH
+            (SELECT max(height) FROM blocks WHERE is_valid = 1) AS maxHeight,
+            toUInt32(greatest(toInt64(maxHeight) - 3000, 0)) AS minHeight
           SELECT toString(sum(tx_count)) as tx_24h
           FROM (
-            SELECT height, tx_count
-            FROM blocks
-            WHERE is_valid = 1 AND timestamp >= ${nowSeconds - 86400}
-            GROUP BY height, tx_count
+            SELECT tx_count
+            FROM (
+              SELECT height, tx_count, timestamp, is_valid
+              FROM blocks
+              WHERE height <= maxHeight AND height > minHeight
+              ORDER BY height DESC, _version DESC
+              LIMIT 1 BY height
+            )
+            WHERE is_valid = 1 AND timestamp >= {cutoff:UInt32}
           )
-        `),
+        `, { cutoff: nowSeconds - 86400 }),
       ]);
 
       const latestBlock = latestBlocks[0] || null;
@@ -1743,17 +2575,22 @@ export class ClickHouseAPIServer {
 
       if (latestBlocks.length > 0) {
         const heights = latestBlocks.map((b: any) => b.height);
-        const heightList = heights.join(',');
 
         // Get coinbase transactions for just these specific heights (partition-efficient)
-        const coinbaseTxs = await this.ch.query<any>(`
-          SELECT txid, block_height, output_total
-          FROM transactions
-          WHERE block_height IN (${heightList}) AND is_coinbase = 1 AND is_valid = 1
-        `);
+	        const coinbaseTxs = await this.ch.query<any>(`
+	          SELECT txid, block_height, output_total
+	          FROM (
+	            SELECT txid, block_height, output_total, is_valid
+            FROM transactions
+            WHERE block_height IN {heights:Array(UInt32)} AND is_coinbase = 1
+            ORDER BY txid, _version DESC
+            LIMIT 1 BY txid
+	          )
+	          WHERE is_valid = 1
+	        `, { heights });
 
-        // Build block lookup map
-        const blockMap = new Map(latestBlocks.map((b: any) => [b.height, b]));
+	        // Build block lookup map
+	        const blockMap = new Map(latestBlocks.map((b: any) => [b.height, b]));
 
         // Merge block info with coinbase transactions
         recentCoinbaseTxs = coinbaseTxs.map((t: any) => {
@@ -1769,13 +2606,18 @@ export class ClickHouseAPIServer {
 
         // Get outputs for coinbase transactions
         if (coinbaseTxs.length > 0) {
-          const txidList = coinbaseTxs.map((t: any) => `'${t.txid}'`).join(',');
+          const txids = coinbaseTxs.map((t: any) => t.txid);
           const outputs = await this.ch.query<{ txid: string; address: string; value: string }>(`
             SELECT txid, address, value
-            FROM utxos
-            WHERE txid IN (${txidList})
+            FROM (
+              SELECT txid, vout, address, value
+              FROM utxos
+              WHERE txid IN {txids:Array(FixedString(64))}
+              ORDER BY txid, vout, version DESC
+              LIMIT 1 BY txid, vout
+            )
             ORDER BY txid, vout
-          `);
+          `, { txids });
 
           for (const out of outputs) {
             const existing = outputsByTxid.get(out.txid) || [];
@@ -1828,7 +2670,17 @@ export class ClickHouseAPIServer {
 
   private async getTxVolumeHistory(req: Request, res: Response): Promise<void> {
     try {
-      const days = Math.min(parseInt(req.query.days as string) || 30, 365);
+      const daysResult = ClickHouseAPIServer.parseBoundedInt(req.query.days, {
+        name: 'days',
+        defaultValue: 30,
+        min: 1,
+        max: 365,
+      });
+      if (daysResult.error) {
+        res.status(400).json({ error: daysResult.error });
+        return;
+      }
+      const days = daysResult.value ?? 30;
       const cutoff = Math.floor(Date.now() / 1000) - (days * 86400);
 
       // Leverages mv_hourly_tx_count materialized view for instant aggregation
@@ -1882,7 +2734,17 @@ export class ClickHouseAPIServer {
 
   private async getSupplyHistory(req: Request, res: Response): Promise<void> {
     try {
-      const days = Math.min(parseInt(req.query.days as string) || 90, 365);
+      const daysResult = ClickHouseAPIServer.parseBoundedInt(req.query.days, {
+        name: 'days',
+        defaultValue: 90,
+        min: 1,
+        max: 365,
+      });
+      if (daysResult.error) {
+        res.status(400).json({ error: daysResult.error });
+        return;
+      }
+      const days = daysResult.value ?? 90;
 
       // Leverages mv_daily_supply materialized view
       const data = await this.ch.query<{
@@ -1898,7 +2760,12 @@ export class ClickHouseAPIServer {
           toString(transparent_supply) as transparent_supply,
           toString(shielded_pool) as shielded_pool,
           toString(total_supply) as total_supply
-        FROM mv_daily_supply
+        FROM (
+          SELECT day, max_height, transparent_supply, shielded_pool, total_supply
+          FROM mv_daily_supply
+          ORDER BY day DESC, max_height DESC
+          LIMIT 1 BY day
+        )
         ORDER BY day DESC
         LIMIT ${days}
       `);
@@ -1907,9 +2774,9 @@ export class ClickHouseAPIServer {
         history: data.map(d => ({
           day: d.day,
           height: d.max_height,
-          transparentSupply: Number(d.transparent_supply) / 1e8,
-          shieldedPool: Number(d.shielded_pool) / 1e8,
-          totalSupply: Number(d.total_supply) / 1e8,
+          transparentSupply: ClickHouseAPIServer.zatoshisToFluxNumber(BigInt(d.transparent_supply)),
+          shieldedPool: ClickHouseAPIServer.zatoshisToFluxNumber(BigInt(d.shielded_pool)),
+          totalSupply: ClickHouseAPIServer.zatoshisToFluxNumber(BigInt(d.total_supply)),
         })),
       });
     } catch (error: any) {

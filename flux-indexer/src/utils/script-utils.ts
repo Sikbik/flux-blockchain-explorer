@@ -81,6 +81,44 @@ function base58Decode(str: string): Buffer {
 }
 
 /**
+ * Encode bytes as base58 (Bitcoin/Zcash alphabet).
+ */
+function base58Encode(data: Buffer): string {
+  if (data.length === 0) {
+    throw new Error('Empty base58 input');
+  }
+
+  const digits: number[] = [0];
+
+  for (const byte of data) {
+    let carry = byte;
+    for (let i = 0; i < digits.length; i++) {
+      const value = digits[i] * 256 + carry;
+      digits[i] = value % 58;
+      carry = Math.floor(value / 58);
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = Math.floor(carry / 58);
+    }
+  }
+
+  // Leading zero bytes become leading '1'
+  let leadingOnes = 0;
+  for (let i = 0; i < data.length; i++) {
+    if (data[i] !== 0) break;
+    leadingOnes++;
+  }
+
+  let result = '1'.repeat(leadingOnes);
+  for (let i = digits.length - 1; i >= 0; i--) {
+    result += BASE58_ALPHABET[digits[i]];
+  }
+
+  return result;
+}
+
+/**
  * Double SHA256 hash (used for checksum verification)
  */
 function doubleSha256(data: Buffer): Buffer {
@@ -95,6 +133,38 @@ export interface DecodedFluxAddress {
   hash160: string;      // 20-byte hash in hex
   type: 'p2pkh' | 'p2sh';
   network: 'mainnet' | 'testnet';
+}
+
+/**
+ * Encode a hash160 as a Flux base58check address.
+ *
+ * @param hash160Hex - 20-byte hash160 in hex
+ * @param type - Address type (p2pkh or p2sh)
+ * @param network - Network (mainnet or testnet)
+ */
+export function encodeFluxAddress(
+  hash160Hex: string,
+  type: 'p2pkh' | 'p2sh',
+  network: 'mainnet' | 'testnet' = 'mainnet'
+): string | null {
+  if (!/^[0-9a-fA-F]{40}$/.test(hash160Hex)) {
+    return null;
+  }
+
+  let version: number;
+  if (network === 'mainnet' && type === 'p2pkh') version = FLUX_MAINNET_P2PKH;
+  else if (network === 'mainnet' && type === 'p2sh') version = FLUX_MAINNET_P2SH;
+  else if (network === 'testnet' && type === 'p2pkh') version = FLUX_TESTNET_P2PKH;
+  else version = FLUX_TESTNET_P2SH;
+
+  const payload = Buffer.alloc(22);
+  payload[0] = (version >> 8) & 0xff;
+  payload[1] = version & 0xff;
+  Buffer.from(hash160Hex, 'hex').copy(payload, 2);
+
+  const checksum = doubleSha256(payload).subarray(0, 4);
+  const addressBytes = Buffer.concat([payload, checksum]);
+  return base58Encode(addressBytes);
 }
 
 /**
